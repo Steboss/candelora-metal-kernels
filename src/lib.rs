@@ -1,4 +1,5 @@
 pub mod adamw;
+pub mod axpy;
 
 #[cfg(test)]
 mod tests {
