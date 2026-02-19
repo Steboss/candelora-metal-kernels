@@ -1,5 +1,6 @@
 pub mod adamw;
 pub mod axpy;
+pub mod kv_attn;
 
 #[cfg(test)]
 mod tests {
