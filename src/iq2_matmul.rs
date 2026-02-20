@@ -55,7 +55,7 @@ impl Iq2MatmulVariant {
         }
     }
 
-    fn kernel_name(self, dtype: DType) -> Result<&'static str> {
+    fn matmul_kernel_name(self, dtype: DType) -> Result<&'static str> {
         Ok(match (self, dtype) {
             (Self::Iq2Xxs, DType::F32) => "iq2_xxs_matmul_f32",
             (Self::Iq2Xxs, DType::F16) => "iq2_xxs_matmul_f16",
@@ -71,6 +71,15 @@ impl Iq2MatmulVariant {
             (Self::Iq3S, DType::BF16) => "iq3_s_matmul_bf16",
             (_, dt) => candle_core::bail!("iq2_matmul unsupported x dtype: {:?}", dt),
         })
+    }
+
+    fn dequant_kernel_name(self) -> &'static str {
+        match self {
+            Self::Iq2Xxs => "iq2_xxs_dequantize_f16",
+            Self::Iq2Xs => "iq2_xs_dequantize_f16",
+            Self::Iq2S => "iq2_s_dequantize_f16",
+            Self::Iq3S => "iq3_s_dequantize_f16",
+        }
     }
 }
 
@@ -259,7 +268,7 @@ fn iq2_matmul_metal(
             candle_core::bail!("iq2_matmul expects contiguous layouts");
         }
 
-        let kernel_name = variant.kernel_name(x_metal.dtype())?;
+        let kernel_name = variant.matmul_kernel_name(x_metal.dtype())?;
 
         let m_u32 = u32::try_from(m).map_err(|_| candle_core::Error::msg("m too large"))?;
         let out_u32 = u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
@@ -318,6 +327,139 @@ fn iq2_matmul_metal(
     }
 }
 
+#[cfg(feature = "metal")]
+fn iq2_dequantize_to_f16_metal(
+    weight_bytes: &Tensor,
+    weight_scales: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+    variant: Iq2MatmulVariant,
+) -> Result<Tensor> {
+    use candle_metal_kernels::BufferOffset;
+    use objc2_metal::MTLSize;
+
+    if out_dim == 0 || in_dim == 0 {
+        candle_core::bail!("iq2_dequantize_to_f16 expects non-zero dimensions")
+    }
+    if !weight_bytes.device().is_metal() {
+        candle_core::bail!("iq2_dequantize_to_f16 requires a Metal device");
+    }
+    if !weight_bytes.device().same_device(weight_scales.device()) {
+        candle_core::bail!(
+            "iq2_dequantize_to_f16 device mismatch: bytes={:?}, scales={:?}",
+            weight_bytes.device(),
+            weight_scales.device()
+        );
+    }
+    if weight_bytes.dtype() != DType::U8 || weight_scales.dtype() != DType::U8 {
+        candle_core::bail!(
+            "iq2_dequantize_to_f16 expects U8 weight bytes/scales, got bytes={:?}, scales={:?}",
+            weight_bytes.dtype(),
+            weight_scales.dtype()
+        );
+    }
+
+    let blocks_per_row = in_dim.div_ceil(IQ2_QK);
+    let expected_bytes = out_dim
+        .checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(variant.bytes_per_block()))
+        .ok_or_else(|| candle_core::Error::msg("iq2_dequantize_to_f16 bytes size overflow"))?;
+    let expected_scales = out_dim
+        .checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(variant.scales_per_block()))
+        .ok_or_else(|| candle_core::Error::msg("iq2_dequantize_to_f16 scales size overflow"))?;
+    if weight_bytes.elem_count() < expected_bytes {
+        candle_core::bail!(
+            "iq2_dequantize_to_f16 weight_bytes too small: got {} expected at least {}",
+            weight_bytes.elem_count(),
+            expected_bytes
+        );
+    }
+    if weight_scales.elem_count() < expected_scales {
+        candle_core::bail!(
+            "iq2_dequantize_to_f16 weight_scales too small: got {} expected at least {}",
+            weight_scales.elem_count(),
+            expected_scales
+        );
+    }
+
+    let out = Tensor::zeros((out_dim, in_dim), DType::F16, weight_bytes.device())?;
+    let total = out_dim
+        .checked_mul(in_dim)
+        .ok_or_else(|| candle_core::Error::msg("iq2_dequantize_to_f16 output size overflow"))?;
+    if total == 0 {
+        return Ok(out);
+    }
+
+    {
+        let (bytes_storage, bytes_layout) = weight_bytes.storage_and_layout();
+        let (scales_storage, scales_layout) = weight_scales.storage_and_layout();
+        let (out_storage, out_layout) = out.storage_and_layout();
+
+        let (bytes_metal, scales_metal, out_metal) =
+            match (&*bytes_storage, &*scales_storage, &*out_storage) {
+                (
+                    candle_core::Storage::Metal(wb),
+                    candle_core::Storage::Metal(ws),
+                    candle_core::Storage::Metal(outm),
+                ) => (wb, ws, outm),
+                _ => candle_core::bail!("iq2_dequantize_to_f16 expected Metal storage"),
+            };
+        if !bytes_layout.is_contiguous() || !scales_layout.is_contiguous() || !out_layout.is_contiguous() {
+            candle_core::bail!("iq2_dequantize_to_f16 expects contiguous layouts");
+        }
+
+        let kernel_name = variant.dequant_kernel_name();
+
+        let out_u32 = u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
+        let in_u32 = u32::try_from(in_dim).map_err(|_| candle_core::Error::msg("in_dim too large"))?;
+        let blocks_u32 = u32::try_from(blocks_per_row)
+            .map_err(|_| candle_core::Error::msg("blocks_per_row too large"))?;
+
+        let metal = bytes_metal.device().metal_device();
+        let pipeline =
+            get_or_create_iq2_matmul_pipeline(bytes_metal.device().id(), metal, kernel_name)?;
+        let encoder = bytes_metal.device().command_encoder()?;
+        encoder.set_label("candelora_iq2_dequantize_to_f16");
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        let bytes_bo = BufferOffset {
+            buffer: bytes_metal.buffer(),
+            offset_in_bytes: bytes_layout.start_offset() * DType::U8.size_in_bytes(),
+        };
+        let scales_bo = BufferOffset {
+            buffer: scales_metal.buffer(),
+            offset_in_bytes: scales_layout.start_offset() * DType::U8.size_in_bytes(),
+        };
+        let out_bo = BufferOffset {
+            buffer: out_metal.buffer(),
+            offset_in_bytes: out_layout.start_offset() * DType::F16.size_in_bytes(),
+        };
+
+        let encoder_ref = &encoder;
+        candle_metal_kernels::set_params!(
+            encoder_ref,
+            (out_u32, in_u32, blocks_u32, &bytes_bo, &scales_bo, &out_bo)
+        );
+
+        let threads = pipeline.max_total_threads_per_threadgroup().min(total.max(1));
+        let groups = total.div_ceil(threads);
+        let tg_count = MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        };
+        let tg_size = MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(tg_count, tg_size);
+    }
+
+    Ok(out)
+}
+
 #[cfg(not(feature = "metal"))]
 fn iq2_matmul_metal(
     _x: &Tensor,
@@ -330,6 +472,19 @@ fn iq2_matmul_metal(
     candle_core::bail!("iq2_matmul requires `candelora-metal-kernels` built with `--features metal`")
 }
 
+#[cfg(not(feature = "metal"))]
+fn iq2_dequantize_to_f16_metal(
+    _weight_bytes: &Tensor,
+    _weight_scales: &Tensor,
+    _out_dim: usize,
+    _in_dim: usize,
+    _variant: Iq2MatmulVariant,
+) -> Result<Tensor> {
+    candle_core::bail!(
+        "iq2_dequantize_to_f16 requires `candelora-metal-kernels` built with `--features metal`"
+    )
+}
+
 /// Generic entry point for IQ2 matmul variants.
 pub fn iq2_matmul(
     x: &Tensor,
@@ -340,6 +495,17 @@ pub fn iq2_matmul(
     variant: Iq2MatmulVariant,
 ) -> Result<Tensor> {
     iq2_matmul_metal(x, weight_bytes, weight_scales, out_dim, in_dim, variant)
+}
+
+/// Dequantizes packed IQ2/IQ3 weights to a dense F16 matrix with shape `[out_dim, in_dim]`.
+pub fn iq2_dequantize_to_f16(
+    weight_bytes: &Tensor,
+    weight_scales: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+    variant: Iq2MatmulVariant,
+) -> Result<Tensor> {
+    iq2_dequantize_to_f16_metal(weight_bytes, weight_scales, out_dim, in_dim, variant)
 }
 
 pub fn iq2_xxs_matmul(
