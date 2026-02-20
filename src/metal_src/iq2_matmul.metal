@@ -258,6 +258,78 @@ template <typename T>
     out[gid] = acc;
 }
 
+template <typename T>
+[[kernel]] void iq3_s_matmul_kernel(
+    constant uint& m [[buffer(0)]],
+    constant uint& out_dim [[buffer(1)]],
+    constant uint& in_dim [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(3)]],
+    const device T* x [[buffer(4)]],
+    const device uchar* w_bytes [[buffer(5)]],
+    const device uchar* w_scales [[buffer(6)]],
+    device float* out [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint n = m * out_dim;
+    if (gid >= n) {
+        return;
+    }
+
+    uint row = gid / out_dim;
+    uint out_idx = gid % out_dim;
+    uint x_base = row * in_dim;
+
+    float acc = 0.0f;
+    for (uint blk = 0; blk < blocks_per_row; ++blk) {
+        uint block_idx = out_idx * blocks_per_row + blk;
+        uint byte_base = block_idx * 104;
+        uint scale_base = block_idx * 6;
+
+        ushort d_bits = read_u16_le(w_scales + scale_base);
+        float d = float(as_type<half>(d_bits));
+
+        const device uchar* qs = w_bytes + byte_base;
+        const device uchar* qh = w_bytes + byte_base + 64;
+        const device uchar* signs = w_bytes + byte_base + 72;
+
+        for (uint ib32 = 0; ib32 < 8; ++ib32) {
+            uchar qh_byte = qh[ib32];
+            uchar scale_nib = (w_scales[scale_base + 2 + (ib32 / 2)] >> (4 * (ib32 % 2))) & 0x0F;
+            float dl = d * (1.0f + 2.0f * float(scale_nib));
+
+            uint qs_off = 8 * ib32;
+            uint signs_off = 4 * ib32;
+            for (uint l = 0; l < 4; ++l) {
+                uint qh_sel0 = (qh_byte & kmask_iq2xs[2 * l + 0]) ? 256u : 0u;
+                uint qh_sel1 = (qh_byte & kmask_iq2xs[2 * l + 1]) ? 256u : 0u;
+                uint idx1 = uint(qs[qs_off + 2 * l + 0]) | qh_sel0;
+                uint idx2 = uint(qs[qs_off + 2 * l + 1]) | qh_sel1;
+                uint grid1 = iq3s_grid[idx1];
+                uint grid2 = iq3s_grid[idx2];
+                uchar sign_byte = signs[signs_off + l];
+                uint base_col = blk * 256 + ib32 * 32 + l * 8;
+
+                for (uint j = 0; j < 4; ++j) {
+                    uint col = base_col + j;
+                    if (col < in_dim) {
+                        uchar gv = uchar((grid1 >> (8 * j)) & 0xFF);
+                        float sgn = (sign_byte & kmask_iq2xs[j]) ? -1.0f : 1.0f;
+                        acc += float(x[x_base + col]) * (dl * float(gv) * sgn);
+                    }
+                    col = base_col + 4 + j;
+                    if (col < in_dim) {
+                        uchar gv = uchar((grid2 >> (8 * j)) & 0xFF);
+                        float sgn = (sign_byte & kmask_iq2xs[4 + j]) ? -1.0f : 1.0f;
+                        acc += float(x[x_base + col]) * (dl * float(gv) * sgn);
+                    }
+                }
+            }
+        }
+    }
+
+    out[gid] = acc;
+}
+
 template [[host_name("iq2_xxs_matmul_f32")]] [[kernel]]
 decltype(iq2_xxs_matmul_kernel<float>) iq2_xxs_matmul_kernel<float>;
 template [[host_name("iq2_xxs_matmul_f16")]] [[kernel]]
@@ -278,3 +350,10 @@ template [[host_name("iq2_s_matmul_f16")]] [[kernel]]
 decltype(iq2_s_matmul_kernel<half>) iq2_s_matmul_kernel<half>;
 template [[host_name("iq2_s_matmul_bf16")]] [[kernel]]
 decltype(iq2_s_matmul_kernel<bfloat>) iq2_s_matmul_kernel<bfloat>;
+
+template [[host_name("iq3_s_matmul_f32")]] [[kernel]]
+decltype(iq3_s_matmul_kernel<float>) iq3_s_matmul_kernel<float>;
+template [[host_name("iq3_s_matmul_f16")]] [[kernel]]
+decltype(iq3_s_matmul_kernel<half>) iq3_s_matmul_kernel<half>;
+template [[host_name("iq3_s_matmul_bf16")]] [[kernel]]
+decltype(iq3_s_matmul_kernel<bfloat>) iq3_s_matmul_kernel<bfloat>;

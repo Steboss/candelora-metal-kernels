@@ -22,12 +22,17 @@ const IQ2_XS_SCALES_PER_BLOCK: usize = 10;
 const IQ2_S_BYTES_PER_BLOCK: usize = 72;
 #[cfg(feature = "metal")]
 const IQ2_S_SCALES_PER_BLOCK: usize = 10;
+#[cfg(feature = "metal")]
+const IQ3_S_BYTES_PER_BLOCK: usize = 104;
+#[cfg(feature = "metal")]
+const IQ3_S_SCALES_PER_BLOCK: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Iq2MatmulVariant {
     Iq2Xxs,
     Iq2Xs,
     Iq2S,
+    Iq3S,
 }
 
 #[cfg(feature = "metal")]
@@ -37,6 +42,7 @@ impl Iq2MatmulVariant {
             Self::Iq2Xxs => IQ2_XXS_BYTES_PER_BLOCK,
             Self::Iq2Xs => IQ2_XS_BYTES_PER_BLOCK,
             Self::Iq2S => IQ2_S_BYTES_PER_BLOCK,
+            Self::Iq3S => IQ3_S_BYTES_PER_BLOCK,
         }
     }
 
@@ -45,6 +51,7 @@ impl Iq2MatmulVariant {
             Self::Iq2Xxs => IQ2_XXS_SCALES_PER_BLOCK,
             Self::Iq2Xs => IQ2_XS_SCALES_PER_BLOCK,
             Self::Iq2S => IQ2_S_SCALES_PER_BLOCK,
+            Self::Iq3S => IQ3_S_SCALES_PER_BLOCK,
         }
     }
 
@@ -59,6 +66,9 @@ impl Iq2MatmulVariant {
             (Self::Iq2S, DType::F32) => "iq2_s_matmul_f32",
             (Self::Iq2S, DType::F16) => "iq2_s_matmul_f16",
             (Self::Iq2S, DType::BF16) => "iq2_s_matmul_bf16",
+            (Self::Iq3S, DType::F32) => "iq3_s_matmul_f32",
+            (Self::Iq3S, DType::F16) => "iq3_s_matmul_f16",
+            (Self::Iq3S, DType::BF16) => "iq3_s_matmul_bf16",
             (_, dt) => candle_core::bail!("iq2_matmul unsupported x dtype: {:?}", dt),
         })
     }
@@ -383,6 +393,23 @@ pub fn iq2_s_matmul(
     )
 }
 
+pub fn iq3_s_matmul(
+    x: &Tensor,
+    weight_bytes: &Tensor,
+    weight_scales: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Tensor> {
+    iq2_matmul(
+        x,
+        weight_bytes,
+        weight_scales,
+        out_dim,
+        in_dim,
+        Iq2MatmulVariant::Iq3S,
+    )
+}
+
 #[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::*;
@@ -396,6 +423,7 @@ mod tests {
         iq2xxs_grid: Vec<u64>,
         iq2xs_grid: Vec<u64>,
         iq2s_grid: Vec<u64>,
+        iq3s_grid: Vec<u32>,
     }
 
     fn parse_numeric_u64(token: &str) -> Option<u64> {
@@ -448,6 +476,14 @@ mod tests {
             .collect()
     }
 
+    fn parse_table_u32(source: &str, name: &str) -> Vec<u32> {
+        extract_table_body(source, name)
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter_map(parse_numeric_u64)
+            .map(|v| u32::try_from(v).expect("u32 table value out of range"))
+            .collect()
+    }
+
     fn ref_tables() -> &'static Iq2RefTables {
         static TABLES: OnceLock<Iq2RefTables> = OnceLock::new();
         TABLES.get_or_init(|| {
@@ -458,6 +494,7 @@ mod tests {
                 iq2xxs_grid: parse_table_u64(source, "iq2xxs_grid"),
                 iq2xs_grid: parse_table_u64(source, "iq2xs_grid"),
                 iq2s_grid: parse_table_u64(source, "iq2s_grid"),
+                iq3s_grid: parse_table_u32(source, "iq3s_grid"),
             }
         })
     }
@@ -502,6 +539,28 @@ mod tests {
         acc: &mut f32,
     ) {
         for (j, &mask) in kmask.iter().enumerate().take(8) {
+            let col = base_col + j;
+            if col >= in_dim {
+                break;
+            }
+            let gv = ((grid_pack >> (8 * j)) & 0xff) as u8;
+            let sign = if (signs & mask) != 0 { -1.0 } else { 1.0 };
+            *acc += x[x_base + col] * (dl * gv as f32 * sign);
+        }
+    }
+
+    fn accum_word_grid_u32(
+        grid_pack: u32,
+        signs: u8,
+        dl: f32,
+        base_col: usize,
+        in_dim: usize,
+        x: &[f32],
+        x_base: usize,
+        kmask: &[u8],
+        acc: &mut f32,
+    ) {
+        for (j, &mask) in kmask.iter().enumerate().take(4) {
             let col = base_col + j;
             if col >= in_dim {
                 break;
@@ -641,6 +700,55 @@ mod tests {
                                 }
                             }
                         }
+                        Iq2MatmulVariant::Iq3S => {
+                            let byte_base = block_idx * IQ3_S_BYTES_PER_BLOCK;
+                            let scale_base = block_idx * IQ3_S_SCALES_PER_BLOCK;
+                            let d = f16::from_bits(read_u16_le(weight_scales, scale_base)).to_f32();
+                            let qs = &weight_bytes[byte_base..byte_base + 64];
+                            let qh = &weight_bytes[byte_base + 64..byte_base + 72];
+                            let signs = &weight_bytes[byte_base + 72..byte_base + 104];
+                            for ib32 in 0..8usize {
+                                let qh_byte = qh[ib32];
+                                let scale_nib = (weight_scales[scale_base + 2 + (ib32 / 2)]
+                                    >> (4 * (ib32 % 2)))
+                                    & 0x0F;
+                                let dl = d * (1.0 + 2.0 * scale_nib as f32);
+                                let qs_off = 8 * ib32;
+                                let signs_off = 4 * ib32;
+                                for l in 0..4usize {
+                                    let qh_mask0 = tables.kmask_iq2xs[2 * l];
+                                    let qh_mask1 = tables.kmask_iq2xs[2 * l + 1];
+                                    let idx1 = usize::from(qs[qs_off + 2 * l])
+                                        | if (qh_byte & qh_mask0) != 0 { 256 } else { 0 };
+                                    let idx2 = usize::from(qs[qs_off + 2 * l + 1])
+                                        | if (qh_byte & qh_mask1) != 0 { 256 } else { 0 };
+                                    let sign_byte = signs[signs_off + l];
+                                    let base_col = blk * IQ2_QK + ib32 * 32 + l * 8;
+                                    accum_word_grid_u32(
+                                        tables.iq3s_grid[idx1],
+                                        sign_byte,
+                                        dl,
+                                        base_col,
+                                        in_dim,
+                                        x,
+                                        x_base,
+                                        &tables.kmask_iq2xs,
+                                        &mut acc,
+                                    );
+                                    accum_word_grid_u32(
+                                        tables.iq3s_grid[idx2],
+                                        sign_byte,
+                                        dl,
+                                        base_col + 4,
+                                        in_dim,
+                                        x,
+                                        x_base,
+                                        &tables.kmask_iq2xs[4..],
+                                        &mut acc,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 out[row * out_dim + out_idx] = acc;
@@ -726,6 +834,11 @@ mod tests {
     #[test]
     fn cpu_vs_metal_parity_iq2_s() -> Result<()> {
         parity_case(Iq2MatmulVariant::Iq2S)
+    }
+
+    #[test]
+    fn cpu_vs_metal_parity_iq3_s() -> Result<()> {
+        parity_case(Iq2MatmulVariant::Iq3S)
     }
 }
 
