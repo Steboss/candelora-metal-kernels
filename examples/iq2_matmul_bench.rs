@@ -1,13 +1,15 @@
 use std::time::Instant;
 
+use candelora_metal_kernels::activation_quant::{ActivationQuantConfig, ActivationQuantMode};
+use candelora_metal_kernels::iq2_matmul::{iq2_matmul_with_activation_quant, Iq2MatmulVariant};
 use candle_core::{DType, Device, Result, Tensor};
-use candelora_metal_kernels::iq2_matmul::{iq2_matmul, Iq2MatmulVariant};
 
 const IQ_QK: usize = 256;
 
 #[derive(Debug, Clone)]
 struct Config {
     variants: Vec<Iq2MatmulVariant>,
+    activation_quant_mode: ActivationQuantMode,
     m: usize,
     out_dim: usize,
     in_dim: usize,
@@ -32,6 +34,8 @@ fn print_usage() {
 Options:
   --variants <csv>       Comma list: iq2-xxs,iq2-xs,iq2-s,iq3-s
                          default: iq2-xxs,iq2-xs,iq2-s,iq3-s
+  --activation-quant-mode <off|w8a8>
+                         Activation quant mode (default: off)
   --m <n>                Batch rows for x (default: 1)
   --out-dim <n>          Output dimension (default: 4096)
   --in-dim <n>           Input dimension (default: 4096)
@@ -70,6 +74,17 @@ fn parse_variant(value: &str) -> Result<Iq2MatmulVariant> {
     }
 }
 
+fn parse_activation_quant_mode(value: &str) -> Result<ActivationQuantMode> {
+    match value {
+        "off" => Ok(ActivationQuantMode::Off),
+        "w8a8" => Ok(ActivationQuantMode::W8A8),
+        other => candle_core::bail!(
+            "invalid --activation-quant-mode `{}` (expected off|w8a8)",
+            other
+        ),
+    }
+}
+
 fn parse_variants(csv: &str) -> Result<Vec<Iq2MatmulVariant>> {
     let mut out = Vec::new();
     for raw in csv.split(',') {
@@ -93,6 +108,7 @@ fn parse_args() -> Result<Config> {
             Iq2MatmulVariant::Iq2S,
             Iq2MatmulVariant::Iq3S,
         ],
+        activation_quant_mode: ActivationQuantMode::Off,
         m: 1,
         out_dim: 4096,
         in_dim: 4096,
@@ -113,6 +129,12 @@ fn parse_args() -> Result<Config> {
                     .next()
                     .ok_or_else(|| candle_core::Error::msg("missing value for --variants"))?;
                 cfg.variants = parse_variants(&value)?;
+            }
+            "--activation-quant-mode" => {
+                let value = args.next().ok_or_else(|| {
+                    candle_core::Error::msg("missing value for --activation-quant-mode")
+                })?;
+                cfg.activation_quant_mode = parse_activation_quant_mode(&value)?;
             }
             "--m" => {
                 let value = args
@@ -227,7 +249,11 @@ fn summarize(values: &[f64]) -> (f64, f64, f64) {
     (mean, p50, p95)
 }
 
-fn bench_variant(device: &Device, cfg: &Config, variant: Iq2MatmulVariant) -> Result<VariantSummary> {
+fn bench_variant(
+    device: &Device,
+    cfg: &Config,
+    variant: Iq2MatmulVariant,
+) -> Result<VariantSummary> {
     let blocks_per_row = cfg.in_dim.div_ceil(IQ_QK);
     let num_blocks = cfg.out_dim * blocks_per_row;
     let mut weight_bytes = lcg_fill(
@@ -249,13 +275,17 @@ fn bench_variant(device: &Device, cfg: &Config, variant: Iq2MatmulVariant) -> Re
     let weight_scales = Tensor::from_slice(&weight_scales, weight_scales.len(), device)?;
 
     for _ in 0..cfg.warmup_runs {
-        let _ = iq2_matmul(
+        let _ = iq2_matmul_with_activation_quant(
             &x,
             &weight_bytes,
             &weight_scales,
             cfg.out_dim,
             cfg.in_dim,
             variant,
+            &ActivationQuantConfig {
+                mode: cfg.activation_quant_mode,
+                strict: false,
+            },
         )?;
         device.synchronize()?;
     }
@@ -263,13 +293,17 @@ fn bench_variant(device: &Device, cfg: &Config, variant: Iq2MatmulVariant) -> Re
     let mut timings_ms = Vec::with_capacity(cfg.runs);
     for _ in 0..cfg.runs {
         let t0 = Instant::now();
-        let y = iq2_matmul(
+        let y = iq2_matmul_with_activation_quant(
             &x,
             &weight_bytes,
             &weight_scales,
             cfg.out_dim,
             cfg.in_dim,
             variant,
+            &ActivationQuantConfig {
+                mode: cfg.activation_quant_mode,
+                strict: false,
+            },
         )?;
         device.synchronize()?;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -298,8 +332,15 @@ fn run() -> Result<()> {
     }
 
     println!(
-        "[iq2-bench] device={:?} dtype={:?} shape=({}, {}, {}) warmup_runs={} runs={}",
-        device, cfg.dtype, cfg.m, cfg.out_dim, cfg.in_dim, cfg.warmup_runs, cfg.runs
+        "[iq2-bench] device={:?} dtype={:?} act_quant={:?} shape=({}, {}, {}) warmup_runs={} runs={}",
+        device,
+        cfg.dtype,
+        cfg.activation_quant_mode,
+        cfg.m,
+        cfg.out_dim,
+        cfg.in_dim,
+        cfg.warmup_runs,
+        cfg.runs
     );
     println!("[iq2-bench] variants={:?}", cfg.variants);
     println!("variant\tmean_ms\tp50_ms\tp95_ms\tmatmuls_per_s");
