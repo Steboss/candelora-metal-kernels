@@ -11,6 +11,7 @@ IN_DIM=4096
 WARMUP_RUNS=5
 RUNS=20
 DTYPE="f16"
+ACTIVATION_QUANT_MODE="off"
 SKIP_PARITY=0
 SKIP_BENCH=0
 
@@ -31,6 +32,8 @@ Options:
   --warmup-runs <n>         Warmup runs for benchmark (default: 5)
   --runs <n>                Measured runs for benchmark (default: 20)
   --dtype <f16|bf16|f32>    Input dtype for benchmark x (default: f16)
+  --activation-quant-mode <off|w8a8>
+                            Activation quant mode for parity+bench (default: off)
   --skip-parity             Skip parity tests
   --skip-bench              Skip benchmark example
   --help                    Show this help
@@ -46,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --warmup-runs) WARMUP_RUNS="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
     --dtype) DTYPE="$2"; shift 2 ;;
+    --activation-quant-mode) ACTIVATION_QUANT_MODE="$2"; shift 2 ;;
     --skip-parity) SKIP_PARITY=1; shift ;;
     --skip-bench) SKIP_BENCH=1; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -63,12 +67,52 @@ normalize_variant() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | xargs
 }
 
+test_name_for_variant_mode() {
+  local variant="$1"
+  local mode="$2"
+  case "${mode}" in
+    off)
+      case "${variant}" in
+        iq2-xxs) echo "cpu_vs_metal_parity_iq2_xxs" ;;
+        iq2-xs) echo "cpu_vs_metal_parity_iq2_xs" ;;
+        iq2-s) echo "cpu_vs_metal_parity_iq2_s" ;;
+        iq3-s) echo "cpu_vs_metal_parity_iq3_s" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    w8a8)
+      case "${variant}" in
+        iq2-xxs) echo "cpu_vs_metal_parity_w8a8_iq2_xxs" ;;
+        iq2-xs) echo "cpu_vs_metal_parity_w8a8_iq2_xs" ;;
+        iq2-s) echo "cpu_vs_metal_parity_w8a8_iq2_s" ;;
+        iq3-s) echo "cpu_vs_metal_parity_w8a8_iq3_s" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_activation_quant_mode() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | xargs
+}
+
+ACTIVATION_QUANT_MODE="$(normalize_activation_quant_mode "${ACTIVATION_QUANT_MODE}")"
+case "${ACTIVATION_QUANT_MODE}" in
+  off|w8a8) ;;
+  *)
+    echo "invalid --activation-quant-mode: ${ACTIVATION_QUANT_MODE} (expected off|w8a8)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${ACTIVATION_QUANT_MODE}" == "w8a8" && "${DTYPE}" == "bf16" ]]; then
+  echo "[iq-kernel] WARN: bf16 + w8a8 mode may be slower/uncommon; keeping as requested"
+fi
+
 test_name_for_variant() {
   case "$1" in
-    iq2-xxs) echo "cpu_vs_metal_parity_iq2_xxs" ;;
-    iq2-xs) echo "cpu_vs_metal_parity_iq2_xs" ;;
-    iq2-s) echo "cpu_vs_metal_parity_iq2_s" ;;
-    iq3-s) echo "cpu_vs_metal_parity_iq3_s" ;;
+    iq2-xxs|iq2-xs|iq2-s|iq3-s) test_name_for_variant_mode "$1" "${ACTIVATION_QUANT_MODE}" ;;
     *) return 1 ;;
   esac
 }
@@ -88,7 +132,7 @@ if [[ "${SKIP_PARITY}" -eq 0 ]]; then
   echo "[iq-kernel] running parity tests..."
   for v in "${VAR_LIST[@]}"; do
     test_name="$(test_name_for_variant "${v}")"
-    echo "[iq-kernel] parity ${v} (${test_name})"
+    echo "[iq-kernel] parity ${v} mode=${ACTIVATION_QUANT_MODE} (${test_name})"
     cargo test -q --features metal "${test_name}"
   done
 fi
@@ -102,5 +146,6 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
     --in-dim "${IN_DIM}" \
     --warmup-runs "${WARMUP_RUNS}" \
     --runs "${RUNS}" \
-    --dtype "${DTYPE}"
+    --dtype "${DTYPE}" \
+    --activation-quant-mode "${ACTIVATION_QUANT_MODE}"
 fi

@@ -1,3 +1,4 @@
+use crate::activation_quant::{ActivationQuantConfig, ActivationQuantMode};
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
 #[cfg(feature = "metal")]
@@ -73,6 +74,24 @@ impl Iq2MatmulVariant {
         })
     }
 
+    fn matmul_w8a8_kernel_name(self, dtype: DType) -> Result<&'static str> {
+        Ok(match (self, dtype) {
+            (Self::Iq2Xxs, DType::F32) => "iq2_xxs_matmul_w8a8_f32",
+            (Self::Iq2Xxs, DType::F16) => "iq2_xxs_matmul_w8a8_f16",
+            (Self::Iq2Xxs, DType::BF16) => "iq2_xxs_matmul_w8a8_bf16",
+            (Self::Iq2Xs, DType::F32) => "iq2_xs_matmul_w8a8_f32",
+            (Self::Iq2Xs, DType::F16) => "iq2_xs_matmul_w8a8_f16",
+            (Self::Iq2Xs, DType::BF16) => "iq2_xs_matmul_w8a8_bf16",
+            (Self::Iq2S, DType::F32) => "iq2_s_matmul_w8a8_f32",
+            (Self::Iq2S, DType::F16) => "iq2_s_matmul_w8a8_f16",
+            (Self::Iq2S, DType::BF16) => "iq2_s_matmul_w8a8_bf16",
+            (Self::Iq3S, DType::F32) => "iq3_s_matmul_w8a8_f32",
+            (Self::Iq3S, DType::F16) => "iq3_s_matmul_w8a8_f16",
+            (Self::Iq3S, DType::BF16) => "iq3_s_matmul_w8a8_bf16",
+            (_, dt) => candle_core::bail!("iq2_matmul_w8a8 unsupported x dtype: {:?}", dt),
+        })
+    }
+
     fn dequant_kernel_name(self) -> &'static str {
         match self {
             Self::Iq2Xxs => "iq2_xxs_dequantize_f16",
@@ -94,8 +113,9 @@ struct Iq2MatmulMetalDeviceCache {
 type Iq2MatmulMetalDeviceId = candle_core::metal_backend::DeviceId;
 
 #[cfg(feature = "metal")]
-static IQ2_MATMUL_METAL_CACHE: OnceLock<RwLock<HashMap<Iq2MatmulMetalDeviceId, Iq2MatmulMetalDeviceCache>>> =
-    OnceLock::new();
+static IQ2_MATMUL_METAL_CACHE: OnceLock<
+    RwLock<HashMap<Iq2MatmulMetalDeviceId, Iq2MatmulMetalDeviceCache>>,
+> = OnceLock::new();
 
 #[cfg(feature = "metal")]
 fn get_or_create_iq2_matmul_pipeline(
@@ -132,12 +152,14 @@ fn get_or_create_iq2_matmul_pipeline(
         .map_err(|e| {
             candle_core::Error::msg(format!("failed compiling iq2-matmul metal source: {e}"))
         })?;
-    let func = library
-        .get_function(kernel_name, None)
-        .map_err(|e| candle_core::Error::msg(format!("failed loading iq2-matmul metal function: {e}")))?;
+    let func = library.get_function(kernel_name, None).map_err(|e| {
+        candle_core::Error::msg(format!("failed loading iq2-matmul metal function: {e}"))
+    })?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| candle_core::Error::msg(format!("failed creating iq2-matmul metal pipeline: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed creating iq2-matmul metal pipeline: {e}"))
+        })?;
 
     let mut pipelines = HashMap::new();
     pipelines.insert(kernel_name, pipeline.clone());
@@ -168,10 +190,7 @@ fn parse_x_shape(x: &Tensor, in_dim: usize) -> Result<(Tensor, usize, bool)> {
             }
             Ok((x.clone(), *m, false))
         }
-        dims => candle_core::bail!(
-            "iq2_matmul expects x rank 1 or 2, got shape {:?}",
-            dims
-        ),
+        dims => candle_core::bail!("iq2_matmul expects x rank 1 or 2, got shape {:?}", dims),
     }
 }
 
@@ -183,6 +202,7 @@ fn iq2_matmul_metal(
     out_dim: usize,
     in_dim: usize,
     variant: Iq2MatmulVariant,
+    activation_quant_mode: ActivationQuantMode,
 ) -> Result<Tensor> {
     use candle_metal_kernels::BufferOffset;
     use objc2_metal::MTLSize;
@@ -193,7 +213,9 @@ fn iq2_matmul_metal(
     if !x.device().is_metal() {
         candle_core::bail!("iq2_matmul requires a Metal device");
     }
-    if !x.device().same_device(weight_bytes.device()) || !x.device().same_device(weight_scales.device()) {
+    if !x.device().same_device(weight_bytes.device())
+        || !x.device().same_device(weight_scales.device())
+    {
         candle_core::bail!(
             "iq2_matmul device mismatch: x={:?}, bytes={:?}, scales={:?}",
             x.device(),
@@ -250,16 +272,20 @@ fn iq2_matmul_metal(
         let (scales_storage, scales_layout) = weight_scales.storage_and_layout();
         let (out_storage, out_layout) = out.storage_and_layout();
 
-        let (x_metal, bytes_metal, scales_metal, out_metal) =
-            match (&*x_storage, &*bytes_storage, &*scales_storage, &*out_storage) {
-                (
-                    candle_core::Storage::Metal(xm),
-                    candle_core::Storage::Metal(wb),
-                    candle_core::Storage::Metal(ws),
-                    candle_core::Storage::Metal(outm),
-                ) => (xm, wb, ws, outm),
-                _ => candle_core::bail!("iq2_matmul expected Metal storage"),
-            };
+        let (x_metal, bytes_metal, scales_metal, out_metal) = match (
+            &*x_storage,
+            &*bytes_storage,
+            &*scales_storage,
+            &*out_storage,
+        ) {
+            (
+                candle_core::Storage::Metal(xm),
+                candle_core::Storage::Metal(wb),
+                candle_core::Storage::Metal(ws),
+                candle_core::Storage::Metal(outm),
+            ) => (xm, wb, ws, outm),
+            _ => candle_core::bail!("iq2_matmul expected Metal storage"),
+        };
         if !x_layout.is_contiguous()
             || !bytes_layout.is_contiguous()
             || !scales_layout.is_contiguous()
@@ -268,16 +294,25 @@ fn iq2_matmul_metal(
             candle_core::bail!("iq2_matmul expects contiguous layouts");
         }
 
-        let kernel_name = variant.matmul_kernel_name(x_metal.dtype())?;
+        let kernel_name = match activation_quant_mode {
+            ActivationQuantMode::Off => variant.matmul_kernel_name(x_metal.dtype())?,
+            ActivationQuantMode::W8A8 => variant.matmul_w8a8_kernel_name(x_metal.dtype())?,
+            ActivationQuantMode::W4A8 => {
+                candle_core::bail!("W4A8 kernel path is not implemented yet")
+            }
+        };
 
         let m_u32 = u32::try_from(m).map_err(|_| candle_core::Error::msg("m too large"))?;
-        let out_u32 = u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
-        let in_u32 = u32::try_from(in_dim).map_err(|_| candle_core::Error::msg("in_dim too large"))?;
+        let out_u32 =
+            u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
+        let in_u32 =
+            u32::try_from(in_dim).map_err(|_| candle_core::Error::msg("in_dim too large"))?;
         let blocks_u32 = u32::try_from(blocks_per_row)
             .map_err(|_| candle_core::Error::msg("blocks_per_row too large"))?;
 
         let metal = x_metal.device().metal_device();
-        let pipeline = get_or_create_iq2_matmul_pipeline(x_metal.device().id(), metal, kernel_name)?;
+        let pipeline =
+            get_or_create_iq2_matmul_pipeline(x_metal.device().id(), metal, kernel_name)?;
         let encoder = x_metal.device().command_encoder()?;
         encoder.set_label("candelora_iq2_matmul");
         encoder.set_compute_pipeline_state(&pipeline);
@@ -305,7 +340,9 @@ fn iq2_matmul_metal(
             (m_u32, out_u32, in_u32, blocks_u32, &x_bo, &bytes_bo, &scales_bo, &out_bo)
         );
 
-        let threads = pipeline.max_total_threads_per_threadgroup().min(total.max(1));
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(total.max(1));
         let groups = total.div_ceil(threads);
         let tg_count = MTLSize {
             width: groups,
@@ -405,14 +442,19 @@ fn iq2_dequantize_to_f16_metal(
                 ) => (wb, ws, outm),
                 _ => candle_core::bail!("iq2_dequantize_to_f16 expected Metal storage"),
             };
-        if !bytes_layout.is_contiguous() || !scales_layout.is_contiguous() || !out_layout.is_contiguous() {
+        if !bytes_layout.is_contiguous()
+            || !scales_layout.is_contiguous()
+            || !out_layout.is_contiguous()
+        {
             candle_core::bail!("iq2_dequantize_to_f16 expects contiguous layouts");
         }
 
         let kernel_name = variant.dequant_kernel_name();
 
-        let out_u32 = u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
-        let in_u32 = u32::try_from(in_dim).map_err(|_| candle_core::Error::msg("in_dim too large"))?;
+        let out_u32 =
+            u32::try_from(out_dim).map_err(|_| candle_core::Error::msg("out_dim too large"))?;
+        let in_u32 =
+            u32::try_from(in_dim).map_err(|_| candle_core::Error::msg("in_dim too large"))?;
         let blocks_u32 = u32::try_from(blocks_per_row)
             .map_err(|_| candle_core::Error::msg("blocks_per_row too large"))?;
 
@@ -442,7 +484,9 @@ fn iq2_dequantize_to_f16_metal(
             (out_u32, in_u32, blocks_u32, &bytes_bo, &scales_bo, &out_bo)
         );
 
-        let threads = pipeline.max_total_threads_per_threadgroup().min(total.max(1));
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(total.max(1));
         let groups = total.div_ceil(threads);
         let tg_count = MTLSize {
             width: groups,
@@ -468,8 +512,11 @@ fn iq2_matmul_metal(
     _out_dim: usize,
     _in_dim: usize,
     _variant: Iq2MatmulVariant,
+    _activation_quant_mode: ActivationQuantMode,
 ) -> Result<Tensor> {
-    candle_core::bail!("iq2_matmul requires `candelora-metal-kernels` built with `--features metal`")
+    candle_core::bail!(
+        "iq2_matmul requires `candelora-metal-kernels` built with `--features metal`"
+    )
 }
 
 #[cfg(not(feature = "metal"))]
@@ -494,7 +541,53 @@ pub fn iq2_matmul(
     in_dim: usize,
     variant: Iq2MatmulVariant,
 ) -> Result<Tensor> {
-    iq2_matmul_metal(x, weight_bytes, weight_scales, out_dim, in_dim, variant)
+    iq2_matmul_metal(
+        x,
+        weight_bytes,
+        weight_scales,
+        out_dim,
+        in_dim,
+        variant,
+        ActivationQuantMode::Off,
+    )
+}
+
+/// Phase-1 contract wrapper for future activation-quantized matmul paths.
+///
+/// Current behavior intentionally matches `iq2_matmul` regardless of
+/// `activation_quant.mode`, unless `strict=true` is set with a non-off mode.
+pub fn iq2_matmul_with_activation_quant(
+    x: &Tensor,
+    weight_bytes: &Tensor,
+    weight_scales: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+    variant: Iq2MatmulVariant,
+    activation_quant: &ActivationQuantConfig,
+) -> Result<Tensor> {
+    match activation_quant.mode {
+        ActivationQuantMode::Off => {
+            iq2_matmul(x, weight_bytes, weight_scales, out_dim, in_dim, variant)
+        }
+        ActivationQuantMode::W8A8 => iq2_matmul_metal(
+            x,
+            weight_bytes,
+            weight_scales,
+            out_dim,
+            in_dim,
+            variant,
+            ActivationQuantMode::W8A8,
+        ),
+        ActivationQuantMode::W4A8 => {
+            if activation_quant.strict {
+                candle_core::bail!(
+                    "activation quant mode {:?} requested in strict mode, but W4A8 kernel path is not implemented yet",
+                    activation_quant.mode
+                );
+            }
+            iq2_matmul(x, weight_bytes, weight_scales, out_dim, in_dim, variant)
+        }
+    }
 }
 
 /// Dequantizes packed IQ2/IQ3 weights to a dense F16 matrix with shape `[out_dim, in_dim]`.
@@ -802,9 +895,12 @@ mod tests {
                                 let dl0 = d * (0.5 + (scale_byte & 0x0F) as f32) * 0.25;
                                 let dl1 = d * (0.5 + ((scale_byte >> 4) & 0x0F) as f32) * 0.25;
                                 let base_col = blk * IQ2_QK + ib32 * 32;
-                                for (w, dl, off) in
-                                    [(q20, dl0, 0usize), (q21, dl0, 8), (q22, dl1, 16), (q23, dl1, 24)]
-                                {
+                                for (w, dl, off) in [
+                                    (q20, dl0, 0usize),
+                                    (q21, dl0, 8),
+                                    (q22, dl1, 16),
+                                    (q23, dl1, 24),
+                                ] {
                                     let grid_idx = (w & 0x1FF) as usize;
                                     let signs_idx = ((w >> 9) & 0x7F) as usize;
                                     accum_word_grid(
@@ -837,9 +933,12 @@ mod tests {
                                     let sign0 = qs[32 + qs_off];
                                     let sign1 = qs[32 + qs_off + 1];
                                     let qh_nib = qh_byte >> (4 * il);
-                                    let dl = d * (0.5 + ((scale_byte >> (4 * il)) & 0x0F) as f32) * 0.25;
-                                    let grid_idx0 = usize::from(qs0) | (((usize::from(qh_nib)) << 8) & 0x300);
-                                    let grid_idx1 = usize::from(qs1) | (((usize::from(qh_nib)) << 6) & 0x300);
+                                    let dl =
+                                        d * (0.5 + ((scale_byte >> (4 * il)) & 0x0F) as f32) * 0.25;
+                                    let grid_idx0 =
+                                        usize::from(qs0) | (((usize::from(qh_nib)) << 8) & 0x300);
+                                    let grid_idx1 =
+                                        usize::from(qs1) | (((usize::from(qh_nib)) << 6) & 0x300);
                                     let base_col = blk * IQ2_QK + ib32 * 32 + il * 16;
                                     accum_word_grid(
                                         tables.iq2s_grid[grid_idx0],
@@ -923,6 +1022,46 @@ mod tests {
         out
     }
 
+    fn rowwise_quant_dequant_w8a8(x: &[f32], m: usize, in_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        for row in 0..m {
+            let start = row * in_dim;
+            let end = start + in_dim;
+            let x_row = &x[start..end];
+            let mut max_abs = 0.0f32;
+            for &v in x_row {
+                max_abs = max_abs.max(v.abs());
+            }
+            let inv_scale = if max_abs < 1e-8 { 1.0 } else { 127.0 / max_abs };
+            for col in 0..in_dim {
+                let q = (x_row[col] * inv_scale).round().clamp(-127.0, 127.0);
+                out[start + col] = q / inv_scale;
+            }
+        }
+        out
+    }
+
+    fn iq2_matmul_reference_w8a8(
+        x: &[f32],
+        m: usize,
+        out_dim: usize,
+        in_dim: usize,
+        weight_bytes: &[u8],
+        weight_scales: &[u8],
+        variant: Iq2MatmulVariant,
+    ) -> Vec<f32> {
+        let x_qdq = rowwise_quant_dequant_w8a8(x, m, in_dim);
+        iq2_matmul_reference(
+            &x_qdq,
+            m,
+            out_dim,
+            in_dim,
+            weight_bytes,
+            weight_scales,
+            variant,
+        )
+    }
+
     fn parity_case(variant: Iq2MatmulVariant) -> Result<()> {
         let device = match Device::metal_if_available(0) {
             Ok(d) if d.is_metal() => d,
@@ -987,6 +1126,132 @@ mod tests {
         Ok(())
     }
 
+    fn w8a8_smoke_case(variant: Iq2MatmulVariant) -> Result<()> {
+        let device = match Device::metal_if_available(0) {
+            Ok(d) if d.is_metal() => d,
+            _ => return Ok(()),
+        };
+
+        let m = 2usize;
+        let out_dim = 6usize;
+        let in_dim = 320usize;
+        let blocks_per_row = in_dim.div_ceil(IQ2_QK);
+        let num_blocks = out_dim * blocks_per_row;
+
+        let mut weight_bytes = lcg_fill(num_blocks * variant.bytes_per_block(), 0x0BADC0DE);
+        let mut weight_scales = lcg_fill(num_blocks * variant.scales_per_block(), 0xD15EA5ED);
+        force_f16_one_per_block(&mut weight_scales, variant.scales_per_block());
+        if let Some(last) = weight_bytes.last_mut() {
+            *last = 0xC3;
+        }
+
+        let x_host = deterministic_x(m, in_dim);
+        let x = Tensor::from_slice(&x_host, (m, in_dim), &device)?;
+        let bytes = Tensor::from_slice(&weight_bytes, weight_bytes.len(), &device)?;
+        let scales = Tensor::from_slice(&weight_scales, weight_scales.len(), &device)?;
+        let y = iq2_matmul_with_activation_quant(
+            &x,
+            &bytes,
+            &scales,
+            out_dim,
+            in_dim,
+            variant,
+            &ActivationQuantConfig {
+                mode: ActivationQuantMode::W8A8,
+                strict: false,
+            },
+        )?;
+        device.synchronize()?;
+        let y_host = y.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
+        assert_eq!(y_host.len(), m);
+        assert_eq!(y_host[0].len(), out_dim);
+        for row in &y_host {
+            for v in row {
+                assert!(
+                    v.is_finite(),
+                    "non-finite output detected for {:?}: {}",
+                    variant,
+                    v
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn parity_case_w8a8(variant: Iq2MatmulVariant) -> Result<()> {
+        let device = match Device::metal_if_available(0) {
+            Ok(d) if d.is_metal() => d,
+            _ => return Ok(()),
+        };
+
+        let m = 2usize;
+        let out_dim = 7usize;
+        let in_dim = 320usize;
+        let blocks_per_row = in_dim.div_ceil(IQ2_QK);
+        let num_blocks = out_dim * blocks_per_row;
+
+        let mut weight_bytes = lcg_fill(num_blocks * variant.bytes_per_block(), 0xA11CE5ED);
+        let mut weight_scales = lcg_fill(num_blocks * variant.scales_per_block(), 0xC0FFEE12);
+        force_f16_one_per_block(&mut weight_scales, variant.scales_per_block());
+
+        if let Some(last) = weight_bytes.last_mut() {
+            *last = 0x5A;
+        }
+
+        let x_host = deterministic_x(m, in_dim);
+        let y_ref = iq2_matmul_reference_w8a8(
+            &x_host,
+            m,
+            out_dim,
+            in_dim,
+            &weight_bytes,
+            &weight_scales,
+            variant,
+        );
+
+        let x = Tensor::from_slice(&x_host, (m, in_dim), &device)?;
+        let bytes = Tensor::from_slice(&weight_bytes, weight_bytes.len(), &device)?;
+        let scales = Tensor::from_slice(&weight_scales, weight_scales.len(), &device)?;
+        let y = iq2_matmul_with_activation_quant(
+            &x,
+            &bytes,
+            &scales,
+            out_dim,
+            in_dim,
+            variant,
+            &ActivationQuantConfig {
+                mode: ActivationQuantMode::W8A8,
+                strict: false,
+            },
+        )?;
+        device.synchronize()?;
+        let y_host = y
+            .to_device(&Device::Cpu)?
+            .reshape((m * out_dim,))?
+            .to_vec1::<f32>()?;
+
+        let mut max_abs = 0f32;
+        for (idx, (a, b)) in y_host.iter().zip(y_ref.iter()).enumerate() {
+            let diff = (a - b).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+            if diff > 3e-3 {
+                panic!(
+                    "IQ2 W8A8 parity mismatch variant={:?} idx={} metal={} ref={} diff={}",
+                    variant, idx, a, b, diff
+                );
+            }
+        }
+        assert!(
+            max_abs <= 3e-3,
+            "IQ2 W8A8 parity max_abs too high for {:?}: {}",
+            variant,
+            max_abs
+        );
+        Ok(())
+    }
+
     #[test]
     fn cpu_vs_metal_parity_iq2_xxs() -> Result<()> {
         parity_case(Iq2MatmulVariant::Iq2Xxs)
@@ -1005,6 +1270,46 @@ mod tests {
     #[test]
     fn cpu_vs_metal_parity_iq3_s() -> Result<()> {
         parity_case(Iq2MatmulVariant::Iq3S)
+    }
+
+    #[test]
+    fn cpu_vs_metal_parity_w8a8_iq2_xxs() -> Result<()> {
+        parity_case_w8a8(Iq2MatmulVariant::Iq2Xxs)
+    }
+
+    #[test]
+    fn cpu_vs_metal_parity_w8a8_iq2_xs() -> Result<()> {
+        parity_case_w8a8(Iq2MatmulVariant::Iq2Xs)
+    }
+
+    #[test]
+    fn cpu_vs_metal_parity_w8a8_iq2_s() -> Result<()> {
+        parity_case_w8a8(Iq2MatmulVariant::Iq2S)
+    }
+
+    #[test]
+    fn cpu_vs_metal_parity_w8a8_iq3_s() -> Result<()> {
+        parity_case_w8a8(Iq2MatmulVariant::Iq3S)
+    }
+
+    #[test]
+    fn w8a8_kernel_smoke_iq2_xxs() -> Result<()> {
+        w8a8_smoke_case(Iq2MatmulVariant::Iq2Xxs)
+    }
+
+    #[test]
+    fn w8a8_kernel_smoke_iq2_xs() -> Result<()> {
+        w8a8_smoke_case(Iq2MatmulVariant::Iq2Xs)
+    }
+
+    #[test]
+    fn w8a8_kernel_smoke_iq2_s() -> Result<()> {
+        w8a8_smoke_case(Iq2MatmulVariant::Iq2S)
+    }
+
+    #[test]
+    fn w8a8_kernel_smoke_iq3_s() -> Result<()> {
+        w8a8_smoke_case(Iq2MatmulVariant::Iq3S)
     }
 }
 
