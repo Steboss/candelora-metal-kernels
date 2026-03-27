@@ -120,6 +120,84 @@ template [[host_name("qk_scores_rowwise_q4_f32")]] [[kernel]] decltype(qk_scores
 template [[host_name("qk_scores_rowwise_q4_f16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, true>) qk_scores_rowwise_quant_kernel<half, true>;
 template [[host_name("qk_scores_rowwise_q4_bf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, true>) qk_scores_rowwise_quant_kernel<bfloat, true>;
 
+
+
+template <typename T>
+[[kernel]] void qk_scores_turboquant_kernel(
+    constant uint& bh_full [[buffer(0)]],
+    constant uint& full_heads [[buffer(1)]],
+    constant uint& kv_heads [[buffer(2)]],
+    constant uint& repeat_factor [[buffer(3)]],
+    constant uint& t [[buffer(4)]],
+    constant uint& d [[buffer(5)]],
+    constant uint& subvector_dim [[buffer(6)]],
+    constant int& signed_max [[buffer(7)]],
+    constant uint& use_residual_signs [[buffer(8)]],
+    constant float& attn_scale [[buffer(9)]],
+    const device T* q [[buffer(10)]],
+    const device uchar* codes [[buffer(11)]],
+    const device float* scales [[buffer(12)]],
+    const device float* pair_signs [[buffer(13)]],
+    const device uchar* residual_signs [[buffer(14)]],
+    const device float* residual_scales [[buffer(15)]],
+    device float* out [[buffer(16)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint n = bh_full * t;
+    if (gid >= n) {
+        return;
+    }
+
+    uint bh_idx = gid / t;
+    uint tok = gid % t;
+    uint b = bh_idx / full_heads;
+    uint h = bh_idx % full_heads;
+    uint kv_h = h / repeat_factor;
+    uint row = (b * kv_heads + kv_h) * t + tok;
+    uint q_base = bh_idx * d;
+    uint row_base = row * d;
+    uint num_subvectors = d / subvector_dim;
+
+    float acc = 0.0f;
+    for (uint pair_idx = 0; pair_idx < (d / 2); ++pair_idx) {
+        uint i = pair_idx * 2;
+        uint j = i + 1;
+        float sign = pair_signs[pair_idx];
+        float qa = float(q[q_base + i]);
+        float qb = float(q[q_base + j]);
+        float q_rot_i = (qa + sign * qb) * 0.7071067811865475244f;
+        float q_rot_j = (-sign * qa + qb) * 0.7071067811865475244f;
+
+        uint sub_i = i / subvector_dim;
+        uint scale_idx_i = row * num_subvectors + sub_i;
+        float sub_scale_i = scales[scale_idx_i];
+        int code_i = int(codes[row_base + i]) - signed_max;
+        acc += q_rot_i * (float(code_i) * sub_scale_i);
+        if (use_residual_signs != 0) {
+            float residual_scale_i = residual_scales[scale_idx_i];
+            float residual_sign_i = residual_signs[row_base + i] == 0 ? -1.0f : 1.0f;
+            acc += q_rot_i * residual_sign_i * residual_scale_i;
+        }
+
+        uint sub_j = j / subvector_dim;
+        uint scale_idx_j = row * num_subvectors + sub_j;
+        float sub_scale_j = scales[scale_idx_j];
+        int code_j = int(codes[row_base + j]) - signed_max;
+        acc += q_rot_j * (float(code_j) * sub_scale_j);
+        if (use_residual_signs != 0) {
+            float residual_scale_j = residual_scales[scale_idx_j];
+            float residual_sign_j = residual_signs[row_base + j] == 0 ? -1.0f : 1.0f;
+            acc += q_rot_j * residual_sign_j * residual_scale_j;
+        }
+    }
+
+    out[gid] = acc * attn_scale;
+}
+
+template [[host_name("qk_scores_turbo_f32")]] [[kernel]] decltype(qk_scores_turboquant_kernel<float>) qk_scores_turboquant_kernel<float>;
+template [[host_name("qk_scores_turbo_f16")]] [[kernel]] decltype(qk_scores_turboquant_kernel<half>) qk_scores_turboquant_kernel<half>;
+template [[host_name("qk_scores_turbo_bf16")]] [[kernel]] decltype(qk_scores_turboquant_kernel<bfloat>) qk_scores_turboquant_kernel<bfloat>;
+
 template <bool IS_Q4>
 [[kernel]] void attn_weighted_sum_rowwise_quant_kernel(
     constant uint& bh_full [[buffer(0)]],
