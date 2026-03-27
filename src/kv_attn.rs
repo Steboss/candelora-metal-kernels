@@ -2201,6 +2201,23 @@ fn cpu_qk_scores_turboquant_impl<T: Copy, F: Fn(T) -> f32 + Copy>(
     out
 }
 
+fn unpack_packed_u8_values(packed: &[u8], bits_per_value: usize, value_count: usize) -> Vec<u8> {
+    debug_assert!(bits_per_value > 0 && bits_per_value <= 8);
+    (0..value_count)
+        .map(|idx| {
+            let start_bit = idx * bits_per_value;
+            let byte_idx = start_bit / 8;
+            let bit_offset = start_bit % 8;
+            let mut word = u16::from(*packed.get(byte_idx).unwrap_or(&0));
+            if bit_offset + bits_per_value > 8 {
+                word |= u16::from(*packed.get(byte_idx + 1).unwrap_or(&0)) << 8;
+            }
+            let mask = (1u16 << bits_per_value) - 1;
+            ((word >> bit_offset) & mask) as u8
+        })
+        .collect()
+}
+
 fn cpu_qk_scores_turboquant(
     q: &Tensor,
     codes: &Tensor,
@@ -2220,14 +2237,19 @@ fn cpu_qk_scores_turboquant(
         .to_dtype(DType::F32)?
         .to_device(&candle_core::Device::Cpu)?;
     let codes = codes.to_device(&candle_core::Device::Cpu)?;
-    let scales = scales.to_device(&candle_core::Device::Cpu)?;
+    let scales = scales
+        .to_dtype(DType::F32)?
+        .to_device(&candle_core::Device::Cpu)?;
     let pair_signs = pair_signs.to_device(&candle_core::Device::Cpu)?;
     let residual_signs = match residual_signs {
         Some(t) => Some(t.to_device(&candle_core::Device::Cpu)?),
         None => None,
     };
     let residual_scales = match residual_scales {
-        Some(t) => Some(t.to_device(&candle_core::Device::Cpu)?),
+        Some(t) => Some(
+            t.to_dtype(DType::F32)?
+                .to_device(&candle_core::Device::Cpu)?,
+        ),
         None => None,
     };
 
@@ -2265,6 +2287,291 @@ fn cpu_qk_scores_turboquant(
     Tensor::from_vec(out, (batch, full_heads, tokens), &candle_core::Device::Cpu)
 }
 
+fn cpu_qk_scores_turboquant_packed(
+    q: &Tensor,
+    packed_codes: &Tensor,
+    scales: &Tensor,
+    pair_signs: &Tensor,
+    packed_residual_signs: Option<&Tensor>,
+    residual_scales: Option<&Tensor>,
+    kv_heads: usize,
+    repeat_factor: usize,
+    tokens: usize,
+    head_dim: usize,
+    subvector_dim: usize,
+    code_bits: usize,
+    kind: TurboQuantKind,
+    scale: f64,
+) -> Result<Tensor> {
+    let q = q
+        .to_dtype(DType::F32)?
+        .to_device(&candle_core::Device::Cpu)?;
+    let packed_codes = packed_codes.to_device(&candle_core::Device::Cpu)?;
+    let scales = scales
+        .to_dtype(DType::F32)?
+        .to_device(&candle_core::Device::Cpu)?;
+    let pair_signs = pair_signs.to_device(&candle_core::Device::Cpu)?;
+    let packed_residual_signs = match packed_residual_signs {
+        Some(t) => Some(t.to_device(&candle_core::Device::Cpu)?),
+        None => None,
+    };
+    let residual_scales = match residual_scales {
+        Some(t) => Some(
+            t.to_dtype(DType::F32)?
+                .to_device(&candle_core::Device::Cpu)?,
+        ),
+        None => None,
+    };
+
+    let (batch, full_heads, _) = q.dims3()?;
+    let q = q.flatten_all()?.to_vec1::<f32>()?;
+    let packed_codes = packed_codes.flatten_all()?.to_vec1::<u8>()?;
+    let scales = scales.flatten_all()?.to_vec1::<f32>()?;
+    let pair_signs = pair_signs.flatten_all()?.to_vec1::<f32>()?;
+    let residual_scales = match residual_scales {
+        Some(t) => Some(t.flatten_all()?.to_vec1::<f32>()?),
+        None => None,
+    };
+    let value_count = batch * kv_heads * tokens * head_dim;
+    let codes = unpack_packed_u8_values(&packed_codes, code_bits, value_count);
+    let residual_signs = match packed_residual_signs {
+        Some(t) => Some(unpack_packed_u8_values(
+            &t.flatten_all()?.to_vec1::<u8>()?,
+            1,
+            value_count,
+        )),
+        None => None,
+    };
+    let out = cpu_qk_scores_turboquant_impl(
+        &q,
+        |v| v,
+        &codes,
+        &scales,
+        &pair_signs,
+        residual_signs.as_deref(),
+        residual_scales.as_deref(),
+        batch,
+        full_heads,
+        kv_heads,
+        repeat_factor,
+        tokens,
+        head_dim,
+        subvector_dim,
+        kind.signed_max(),
+        scale as f32,
+    );
+    Tensor::from_vec(out, (batch, full_heads, tokens), &candle_core::Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+fn turboquant_kernel_name(
+    q_dtype: DType,
+    scale_dtype: DType,
+    subvector_dim: usize,
+    packed: bool,
+    code_bits: Option<usize>,
+    has_residual: bool,
+) -> Result<&'static str> {
+    let name = match (
+        q_dtype,
+        scale_dtype,
+        subvector_dim,
+        packed,
+        code_bits,
+        has_residual,
+    ) {
+        (DType::F16, DType::F16, 4, true, Some(3), false) => {
+            "qk_scores_turbo_packed_fast_sv4c3_nr_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 4, true, Some(3), true) => {
+            "qk_scores_turbo_packed_fast_sv4c3_res_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 4, true, Some(4), false) => {
+            "qk_scores_turbo_packed_fast_sv4c4_nr_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 4, true, Some(4), true) => {
+            "qk_scores_turbo_packed_fast_sv4c4_res_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 8, true, Some(3), false) => {
+            "qk_scores_turbo_packed_fast_sv8c3_nr_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 8, true, Some(3), true) => {
+            "qk_scores_turbo_packed_fast_sv8c3_res_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 8, true, Some(4), false) => {
+            "qk_scores_turbo_packed_fast_sv8c4_nr_qf16_sf16"
+        }
+        (DType::F16, DType::F16, 8, true, Some(4), true) => {
+            "qk_scores_turbo_packed_fast_sv8c4_res_qf16_sf16"
+        }
+        (DType::F32, DType::F32, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qf32_sf32",
+        (DType::F32, DType::F16, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qf32_sf16",
+        (DType::F16, DType::F32, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qf16_sf32",
+        (DType::F16, DType::F16, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qf16_sf16",
+        (DType::BF16, DType::F32, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qbf16_sf32",
+        (DType::BF16, DType::F16, 4, true, _, _) => "qk_scores_turbo_packed_sv4_qbf16_sf16",
+        (DType::F32, DType::F32, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qf32_sf32",
+        (DType::F32, DType::F16, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qf32_sf16",
+        (DType::F16, DType::F32, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qf16_sf32",
+        (DType::F16, DType::F16, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qf16_sf16",
+        (DType::BF16, DType::F32, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qbf16_sf32",
+        (DType::BF16, DType::F16, 8, true, _, _) => "qk_scores_turbo_packed_sv8_qbf16_sf16",
+        (DType::F32, DType::F32, _, true, _, _) => "qk_scores_turbo_packed_qf32_sf32",
+        (DType::F32, DType::F16, _, true, _, _) => "qk_scores_turbo_packed_qf32_sf16",
+        (DType::F16, DType::F32, _, true, _, _) => "qk_scores_turbo_packed_qf16_sf32",
+        (DType::F16, DType::F16, _, true, _, _) => "qk_scores_turbo_packed_qf16_sf16",
+        (DType::BF16, DType::F32, _, true, _, _) => "qk_scores_turbo_packed_qbf16_sf32",
+        (DType::BF16, DType::F16, _, true, _, _) => "qk_scores_turbo_packed_qbf16_sf16",
+        (DType::F32, DType::F32, 4, false, _, _) => "qk_scores_turbo_sv4_qf32_sf32",
+        (DType::F32, DType::F16, 4, false, _, _) => "qk_scores_turbo_sv4_qf32_sf16",
+        (DType::F16, DType::F32, 4, false, _, _) => "qk_scores_turbo_sv4_qf16_sf32",
+        (DType::F16, DType::F16, 4, false, _, _) => "qk_scores_turbo_sv4_qf16_sf16",
+        (DType::BF16, DType::F32, 4, false, _, _) => "qk_scores_turbo_sv4_qbf16_sf32",
+        (DType::BF16, DType::F16, 4, false, _, _) => "qk_scores_turbo_sv4_qbf16_sf16",
+        (DType::F32, DType::F32, 8, false, _, _) => "qk_scores_turbo_sv8_qf32_sf32",
+        (DType::F32, DType::F16, 8, false, _, _) => "qk_scores_turbo_sv8_qf32_sf16",
+        (DType::F16, DType::F32, 8, false, _, _) => "qk_scores_turbo_sv8_qf16_sf32",
+        (DType::F16, DType::F16, 8, false, _, _) => "qk_scores_turbo_sv8_qf16_sf16",
+        (DType::BF16, DType::F32, 8, false, _, _) => "qk_scores_turbo_sv8_qbf16_sf32",
+        (DType::BF16, DType::F16, 8, false, _, _) => "qk_scores_turbo_sv8_qbf16_sf16",
+        (DType::F32, DType::F32, _, false, _, _) => "qk_scores_turbo_qf32_sf32",
+        (DType::F32, DType::F16, _, false, _, _) => "qk_scores_turbo_qf32_sf16",
+        (DType::F16, DType::F32, _, false, _, _) => "qk_scores_turbo_qf16_sf32",
+        (DType::F16, DType::F16, _, false, _, _) => "qk_scores_turbo_qf16_sf16",
+        (DType::BF16, DType::F32, _, false, _, _) => "qk_scores_turbo_qbf16_sf32",
+        (DType::BF16, DType::F16, _, false, _, _) => "qk_scores_turbo_qbf16_sf16",
+        dtypes => {
+            candle_core::bail!(
+                "unsupported (q, scales, subvector_dim, packed, code_bits, has_residual) for turboquant qk op: {:?}",
+                dtypes
+            )
+        }
+    };
+    Ok(name)
+}
+
+#[cfg(feature = "metal")]
+fn turboquant_grouped_threads(max_threads: usize, default_threads: usize) -> usize {
+    let parsed = std::env::var("CANDELORA_TURBO_TG_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    parsed.unwrap_or(default_threads).min(max_threads).max(1)
+}
+
+#[cfg(feature = "metal")]
+fn rotate_pairwise_query_kernel_name(q_dtype: DType) -> Result<&'static str> {
+    let name = match q_dtype {
+        DType::F32 => "rotate_pairwise_query_f32",
+        DType::F16 => "rotate_pairwise_query_f16",
+        DType::BF16 => "rotate_pairwise_query_bf16",
+        dtype => {
+            candle_core::bail!(
+                "unsupported q dtype for turboquant query rotation: {:?}",
+                dtype
+            )
+        }
+    };
+    Ok(name)
+}
+
+#[cfg(feature = "metal")]
+fn try_rotate_pairwise_query_metal(q: &Tensor, pair_signs: &Tensor) -> Result<Option<Tensor>> {
+    use candle_metal_kernels::BufferOffset;
+    use objc2_metal::MTLSize;
+
+    if !q.device().is_metal() {
+        return Ok(None);
+    }
+
+    let q = q.contiguous()?;
+    let pair_signs = pair_signs.contiguous()?;
+    let (batch, full_heads, head_dim) = q.dims3()?;
+    if head_dim % 2 != 0 {
+        candle_core::bail!(
+            "turboquant pairwise query rotation requires even head_dim, got {}",
+            head_dim
+        );
+    }
+    let pair_dims = pair_signs.dims();
+    if pair_dims != [head_dim / 2] {
+        candle_core::bail!(
+            "turboquant pairwise query rotation pair_signs shape mismatch: got {:?}, expected [{}]",
+            pair_dims,
+            head_dim / 2
+        );
+    }
+
+    let out = Tensor::zeros((batch, full_heads, head_dim), q.dtype(), q.device())?;
+    if out.elem_count() == 0 {
+        return Ok(Some(out));
+    }
+
+    {
+        let (q_storage, q_layout) = q.storage_and_layout();
+        let (pair_storage, pair_layout) = pair_signs.storage_and_layout();
+        let (out_storage, out_layout) = out.storage_and_layout();
+        let (q_metal, pair_metal, out_metal) = match (&*q_storage, &*pair_storage, &*out_storage) {
+            (
+                candle_core::Storage::Metal(qm),
+                candle_core::Storage::Metal(pm),
+                candle_core::Storage::Metal(om),
+            ) => (qm, pm, om),
+            _ => return Ok(None),
+        };
+        if !q_layout.is_contiguous() || !pair_layout.is_contiguous() || !out_layout.is_contiguous()
+        {
+            candle_core::bail!("turboquant pairwise query rotation expects contiguous layouts");
+        }
+
+        let kernel_name = rotate_pairwise_query_kernel_name(q_metal.dtype())?;
+        let bh_full = batch * full_heads;
+        let pair_elems = bh_full * (head_dim / 2);
+        let bh_u32 =
+            u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
+        let d_u32 =
+            u32::try_from(head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+
+        let metal = q_metal.device().metal_device();
+        let pipeline = get_or_create_kv_attn_pipeline(q_metal.device().id(), metal, kernel_name)?;
+        let encoder = q_metal.device().command_encoder()?;
+        encoder.set_label("candelora_kv_attn_turbo_rotate_q");
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        let q_bo = BufferOffset {
+            buffer: q_metal.buffer(),
+            offset_in_bytes: q_layout.start_offset() * q_metal.dtype().size_in_bytes(),
+        };
+        let pair_bo = BufferOffset {
+            buffer: pair_metal.buffer(),
+            offset_in_bytes: pair_layout.start_offset() * DType::F32.size_in_bytes(),
+        };
+        let out_bo = BufferOffset {
+            buffer: out_metal.buffer(),
+            offset_in_bytes: out_layout.start_offset() * q_metal.dtype().size_in_bytes(),
+        };
+        let encoder_ref = &encoder;
+        candle_metal_kernels::set_params!(encoder_ref, (bh_u32, d_u32, &q_bo, &pair_bo, &out_bo));
+
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(pair_elems.max(1));
+        let groups = pair_elems.div_ceil(threads);
+        let tg_count = MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        };
+        let tg_size = MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(tg_count, tg_size);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(feature = "metal")]
 fn try_qk_scores_turboquant_metal(
     q: &Tensor,
@@ -2296,23 +2603,38 @@ fn try_qk_scores_turboquant_metal(
             &dummy_residual_signs
         }
     };
+    let scale_dtype = scales.dtype();
     let dummy_residual_scales;
     let residual_scales = match residual_scales {
         Some(t) => t,
         None => {
-            dummy_residual_scales = Tensor::zeros((1,), DType::F32, q.device())?;
+            dummy_residual_scales = Tensor::zeros((1,), scale_dtype, q.device())?;
             &dummy_residual_scales
         }
     };
 
-    let (batch, full_heads, _) = q.dims3()?;
-    let out = Tensor::zeros((batch, full_heads, tokens), DType::F32, q.device())?;
+    let use_grouped_kernel = matches!(subvector_dim, 4 | 8) && head_dim <= 256;
+    let q_for_kernel = if use_grouped_kernel {
+        q.contiguous()?
+    } else {
+        match try_rotate_pairwise_query_metal(q, pair_signs)? {
+            Some(t) => t,
+            None => return Ok(None),
+        }
+    };
+
+    let (batch, full_heads, _) = q_for_kernel.dims3()?;
+    let out = Tensor::zeros(
+        (batch, full_heads, tokens),
+        DType::F32,
+        q_for_kernel.device(),
+    )?;
     if out.elem_count() == 0 {
         return Ok(Some(out));
     }
 
     {
-        let (q_storage, q_layout) = q.storage_and_layout();
+        let (q_storage, q_layout) = q_for_kernel.storage_and_layout();
         let (codes_storage, codes_layout) = codes.storage_and_layout();
         let (scales_storage, scales_layout) = scales.storage_and_layout();
         let (pair_storage, pair_layout) = pair_signs.storage_and_layout();
@@ -2361,12 +2683,14 @@ fn try_qk_scores_turboquant_metal(
             candle_core::bail!("turboquant qk expects contiguous layouts");
         }
 
-        let kernel_name = match q_metal.dtype() {
-            DType::F32 => "qk_scores_turbo_f32",
-            DType::F16 => "qk_scores_turbo_f16",
-            DType::BF16 => "qk_scores_turbo_bf16",
-            dt => candle_core::bail!("unsupported q dtype for turboquant qk op: {:?}", dt),
-        };
+        let kernel_name = turboquant_kernel_name(
+            q_metal.dtype(),
+            scales_metal.dtype(),
+            subvector_dim,
+            false,
+            None,
+            residual_signs.elem_count() > 1,
+        )?;
 
         let bh_full = batch * full_heads;
         let out_elems = bh_full * tokens;
@@ -2403,7 +2727,7 @@ fn try_qk_scores_turboquant_metal(
         };
         let scales_bo = BufferOffset {
             buffer: scales_metal.buffer(),
-            offset_in_bytes: scales_layout.start_offset() * DType::F32.size_in_bytes(),
+            offset_in_bytes: scales_layout.start_offset() * scales_metal.dtype().size_in_bytes(),
         };
         let pair_bo = BufferOffset {
             buffer: pair_metal.buffer(),
@@ -2415,7 +2739,8 @@ fn try_qk_scores_turboquant_metal(
         };
         let residual_scales_bo = BufferOffset {
             buffer: residual_scales_metal.buffer(),
-            offset_in_bytes: residual_scales_layout.start_offset() * DType::F32.size_in_bytes(),
+            offset_in_bytes: residual_scales_layout.start_offset()
+                * residual_scales_metal.dtype().size_in_bytes(),
         };
         let out_bo = BufferOffset {
             buffer: out_metal.buffer(),
@@ -2445,19 +2770,280 @@ fn try_qk_scores_turboquant_metal(
             )
         );
 
-        let threads = pipeline
-            .max_total_threads_per_threadgroup()
-            .min(out_elems.max(1));
-        let groups = out_elems.div_ceil(threads);
-        let tg_count = MTLSize {
-            width: groups,
-            height: 1,
-            depth: 1,
+        let (tg_count, tg_size) = if use_grouped_kernel {
+            let threads =
+                turboquant_grouped_threads(pipeline.max_total_threads_per_threadgroup(), 256);
+            (
+                MTLSize {
+                    width: bh_full,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        } else {
+            let threads = pipeline
+                .max_total_threads_per_threadgroup()
+                .min(out_elems.max(1));
+            let groups = out_elems.div_ceil(threads);
+            (
+                MTLSize {
+                    width: groups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            )
         };
-        let tg_size = MTLSize {
-            width: threads,
-            height: 1,
-            depth: 1,
+        encoder.dispatch_thread_groups(tg_count, tg_size);
+    }
+    Ok(Some(out))
+}
+
+#[cfg(feature = "metal")]
+fn try_qk_scores_turboquant_packed_metal(
+    q: &Tensor,
+    packed_codes: &Tensor,
+    scales: &Tensor,
+    pair_signs: &Tensor,
+    packed_residual_signs: Option<&Tensor>,
+    residual_scales: Option<&Tensor>,
+    kv_heads: usize,
+    repeat_factor: usize,
+    tokens: usize,
+    head_dim: usize,
+    subvector_dim: usize,
+    code_bits: usize,
+    kind: TurboQuantKind,
+    scale: f64,
+) -> Result<Option<Tensor>> {
+    use candle_metal_kernels::BufferOffset;
+    use objc2_metal::MTLSize;
+
+    if !q.device().is_metal() {
+        return Ok(None);
+    }
+
+    let has_residual_signs = packed_residual_signs.is_some();
+    let dummy_residual_signs;
+    let packed_residual_signs = match packed_residual_signs {
+        Some(t) => t,
+        None => {
+            dummy_residual_signs = Tensor::zeros((1,), DType::U8, q.device())?;
+            &dummy_residual_signs
+        }
+    };
+    let scale_dtype = scales.dtype();
+    let dummy_residual_scales;
+    let residual_scales = match residual_scales {
+        Some(t) => t,
+        None => {
+            dummy_residual_scales = Tensor::zeros((1,), scale_dtype, q.device())?;
+            &dummy_residual_scales
+        }
+    };
+
+    let use_grouped_kernel = matches!(subvector_dim, 4 | 8) && head_dim <= 256;
+    let q_for_kernel = if use_grouped_kernel {
+        q.contiguous()?
+    } else {
+        match try_rotate_pairwise_query_metal(q, pair_signs)? {
+            Some(t) => t,
+            None => return Ok(None),
+        }
+    };
+
+    let (batch, full_heads, _) = q_for_kernel.dims3()?;
+    let out = Tensor::zeros(
+        (batch, full_heads, tokens),
+        DType::F32,
+        q_for_kernel.device(),
+    )?;
+    if out.elem_count() == 0 {
+        return Ok(Some(out));
+    }
+
+    {
+        let (q_storage, q_layout) = q_for_kernel.storage_and_layout();
+        let (codes_storage, codes_layout) = packed_codes.storage_and_layout();
+        let (scales_storage, scales_layout) = scales.storage_and_layout();
+        let (pair_storage, pair_layout) = pair_signs.storage_and_layout();
+        let (residual_bits_storage, residual_bits_layout) =
+            packed_residual_signs.storage_and_layout();
+        let (residual_scales_storage, residual_scales_layout) =
+            residual_scales.storage_and_layout();
+        let (out_storage, out_layout) = out.storage_and_layout();
+
+        let (
+            q_metal,
+            codes_metal,
+            scales_metal,
+            pair_metal,
+            residual_bits_metal,
+            residual_scales_metal,
+            out_metal,
+        ) = match (
+            &*q_storage,
+            &*codes_storage,
+            &*scales_storage,
+            &*pair_storage,
+            &*residual_bits_storage,
+            &*residual_scales_storage,
+            &*out_storage,
+        ) {
+            (
+                candle_core::Storage::Metal(qm),
+                candle_core::Storage::Metal(cm),
+                candle_core::Storage::Metal(sm),
+                candle_core::Storage::Metal(pm),
+                candle_core::Storage::Metal(rbm),
+                candle_core::Storage::Metal(rsm),
+                candle_core::Storage::Metal(om),
+            ) => (qm, cm, sm, pm, rbm, rsm, om),
+            _ => return Ok(None),
+        };
+
+        if !q_layout.is_contiguous()
+            || !codes_layout.is_contiguous()
+            || !scales_layout.is_contiguous()
+            || !pair_layout.is_contiguous()
+            || !residual_bits_layout.is_contiguous()
+            || !residual_scales_layout.is_contiguous()
+            || !out_layout.is_contiguous()
+        {
+            candle_core::bail!("turboquant packed qk expects contiguous layouts");
+        }
+
+        let kernel_name = turboquant_kernel_name(
+            q_metal.dtype(),
+            scales_metal.dtype(),
+            subvector_dim,
+            true,
+            Some(code_bits),
+            has_residual_signs,
+        )?;
+
+        let bh_full = batch * full_heads;
+        let out_elems = bh_full * tokens;
+        let bh_u32 =
+            u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
+        let full_heads_u32 = u32::try_from(full_heads)
+            .map_err(|_| candle_core::Error::msg("full_heads too large"))?;
+        let kv_heads_u32 =
+            u32::try_from(kv_heads).map_err(|_| candle_core::Error::msg("kv_heads too large"))?;
+        let repeat_u32 = u32::try_from(repeat_factor)
+            .map_err(|_| candle_core::Error::msg("repeat_factor too large"))?;
+        let t_u32 =
+            u32::try_from(tokens).map_err(|_| candle_core::Error::msg("tokens too large"))?;
+        let d_u32 =
+            u32::try_from(head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let sub_u32 = u32::try_from(subvector_dim)
+            .map_err(|_| candle_core::Error::msg("subvector_dim too large"))?;
+        let code_bits_u32 =
+            u32::try_from(code_bits).map_err(|_| candle_core::Error::msg("code_bits too large"))?;
+        let signed_max = kind.signed_max();
+        let use_residual_signs = u32::from(has_residual_signs);
+
+        let metal = q_metal.device().metal_device();
+        let pipeline = get_or_create_kv_attn_pipeline(q_metal.device().id(), metal, kernel_name)?;
+        let encoder = q_metal.device().command_encoder()?;
+        encoder.set_label("candelora_kv_attn_turbo_qk_packed");
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        let q_bo = BufferOffset {
+            buffer: q_metal.buffer(),
+            offset_in_bytes: q_layout.start_offset() * q_metal.dtype().size_in_bytes(),
+        };
+        let codes_bo = BufferOffset {
+            buffer: codes_metal.buffer(),
+            offset_in_bytes: codes_layout.start_offset() * DType::U8.size_in_bytes(),
+        };
+        let scales_bo = BufferOffset {
+            buffer: scales_metal.buffer(),
+            offset_in_bytes: scales_layout.start_offset() * scales_metal.dtype().size_in_bytes(),
+        };
+        let pair_bo = BufferOffset {
+            buffer: pair_metal.buffer(),
+            offset_in_bytes: pair_layout.start_offset() * DType::F32.size_in_bytes(),
+        };
+        let residual_bits_bo = BufferOffset {
+            buffer: residual_bits_metal.buffer(),
+            offset_in_bytes: residual_bits_layout.start_offset() * DType::U8.size_in_bytes(),
+        };
+        let residual_scales_bo = BufferOffset {
+            buffer: residual_scales_metal.buffer(),
+            offset_in_bytes: residual_scales_layout.start_offset()
+                * residual_scales_metal.dtype().size_in_bytes(),
+        };
+        let out_bo = BufferOffset {
+            buffer: out_metal.buffer(),
+            offset_in_bytes: out_layout.start_offset() * DType::F32.size_in_bytes(),
+        };
+        let encoder_ref = &encoder;
+        candle_metal_kernels::set_params!(
+            encoder_ref,
+            (
+                bh_u32,
+                full_heads_u32,
+                kv_heads_u32,
+                repeat_u32,
+                t_u32,
+                d_u32,
+                sub_u32,
+                code_bits_u32,
+                signed_max,
+                use_residual_signs,
+                scale as f32,
+                &q_bo,
+                &codes_bo,
+                &scales_bo,
+                &pair_bo,
+                &residual_bits_bo,
+                &residual_scales_bo,
+                &out_bo
+            )
+        );
+
+        let (tg_count, tg_size) = if use_grouped_kernel {
+            let threads =
+                turboquant_grouped_threads(pipeline.max_total_threads_per_threadgroup(), 256);
+            (
+                MTLSize {
+                    width: bh_full,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        } else {
+            let threads = pipeline
+                .max_total_threads_per_threadgroup()
+                .min(out_elems.max(1));
+            let groups = out_elems.div_ceil(threads);
+            (
+                MTLSize {
+                    width: groups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            )
         };
         encoder.dispatch_thread_groups(tg_count, tg_size);
     }
@@ -2469,10 +3055,10 @@ fn try_qk_scores_turboquant_metal(
 /// Shapes:
 /// - `q`: `[batch, full_heads, head_dim]`
 /// - `codes`: `[rows, head_dim]` with `rows = batch * kv_heads * tokens`
-/// - `scales`: `[rows, num_subvectors]`
+/// - `scales`: `[rows, num_subvectors]` in `F32` or `F16`
 /// - `pair_signs`: `[head_dim / 2]`
 /// - `residual_signs`: optional `[rows, head_dim]` in `U8` with values `0|1`
-/// - `residual_scales`: optional `[rows, num_subvectors]` in `F32`
+/// - `residual_scales`: optional `[rows, num_subvectors]` in `F32` or `F16`
 ///
 /// Returns:
 /// - `[batch, full_heads, tokens]` in `F32`.
@@ -2575,8 +3161,11 @@ pub fn qk_scores_turboquant(
             num_subvectors
         )
     }
-    if scales.dtype() != DType::F32 {
-        candle_core::bail!("turboquant qk expects F32 scales, got {:?}", scales.dtype())
+    if !matches!(scales.dtype(), DType::F32 | DType::F16) {
+        candle_core::bail!(
+            "turboquant qk expects F32 or F16 scales, got {:?}",
+            scales.dtype()
+        )
     }
     let pair_dims = pair_signs.dims();
     if pair_dims != [head_dim / 2] {
@@ -2629,9 +3218,16 @@ pub fn qk_scores_turboquant(
                 num_subvectors
             )
         }
-        if rscales.dtype() != DType::F32 {
+        if !matches!(rscales.dtype(), DType::F32 | DType::F16) {
             candle_core::bail!(
-                "turboquant qk expects F32 residual_scales, got {:?}",
+                "turboquant qk expects F32 or F16 residual_scales, got {:?}",
+                rscales.dtype()
+            )
+        }
+        if rscales.dtype() != scales.dtype() {
+            candle_core::bail!(
+                "turboquant qk expects residual_scales dtype to match scales dtype (scales={:?}, residual_scales={:?})",
+                scales.dtype(),
                 rscales.dtype()
             )
         }
@@ -2681,9 +3277,260 @@ pub fn qk_scores_turboquant(
     )
 }
 
+/// Computes q·k^T for TurboQuant cold keys stored in packed-code form.
+///
+/// Shapes:
+/// - `q`: `[batch, full_heads, head_dim]`
+/// - `packed_codes`: `[packed_code_bytes]`
+/// - `scales`: `[rows, num_subvectors]` in `F32` or `F16`
+/// - `pair_signs`: `[head_dim / 2]`
+/// - `packed_residual_signs`: optional `[packed_sign_bytes]`
+/// - `residual_scales`: optional `[rows, num_subvectors]` in `F32` or `F16`
+///
+/// Where:
+/// - `rows = batch * kv_heads * tokens`
+/// - `packed_code_bytes = ceil(rows * head_dim * code_bits / 8)`
+/// - `packed_sign_bytes = ceil(rows * head_dim / 8)`
+///
+/// Returns:
+/// - `[batch, full_heads, tokens]` in `F32`.
+pub fn qk_scores_turboquant_packed(
+    q: &Tensor,
+    packed_codes: &Tensor,
+    scales: &Tensor,
+    pair_signs: &Tensor,
+    packed_residual_signs: Option<&Tensor>,
+    residual_scales: Option<&Tensor>,
+    kv_heads: usize,
+    repeat_factor: usize,
+    tokens: usize,
+    head_dim: usize,
+    subvector_dim: usize,
+    code_bits: usize,
+    kind: TurboQuantKind,
+    scale: f64,
+) -> Result<Tensor> {
+    if repeat_factor == 0 {
+        candle_core::bail!("turboquant packed qk requires repeat_factor > 0")
+    }
+    if head_dim == 0 {
+        candle_core::bail!("turboquant packed qk requires head_dim > 0")
+    }
+    if subvector_dim == 0 {
+        candle_core::bail!("turboquant packed qk requires subvector_dim > 0")
+    }
+    if code_bits == 0 || code_bits > 8 {
+        candle_core::bail!(
+            "turboquant packed qk requires code_bits in 1..=8, got {}",
+            code_bits
+        )
+    }
+    if head_dim % 2 != 0 {
+        candle_core::bail!(
+            "turboquant packed qk requires even head_dim for pairwise rotation, got {}",
+            head_dim
+        )
+    }
+    if head_dim % subvector_dim != 0 {
+        candle_core::bail!(
+            "turboquant packed qk requires head_dim divisible by subvector_dim ({} % {} != 0)",
+            head_dim,
+            subvector_dim
+        )
+    }
+    if packed_residual_signs.is_some() ^ residual_scales.is_some() {
+        candle_core::bail!(
+            "turboquant packed qk requires packed_residual_signs and residual_scales together"
+        )
+    }
+
+    let q = q.contiguous()?;
+    let packed_codes = packed_codes.contiguous()?;
+    let scales = scales.contiguous()?;
+    let pair_signs = pair_signs.contiguous()?;
+    let packed_residual_signs = match packed_residual_signs {
+        Some(t) => Some(t.contiguous()?),
+        None => None,
+    };
+    let residual_scales = match residual_scales {
+        Some(t) => Some(t.contiguous()?),
+        None => None,
+    };
+
+    let qd = q.dims();
+    if qd.len() != 3 {
+        candle_core::bail!(
+            "turboquant packed qk expects q rank-3 [b,h,d], got {:?}",
+            qd
+        )
+    }
+    let batch = qd[0];
+    let full_heads = qd[1];
+    if qd[2] != head_dim {
+        candle_core::bail!(
+            "turboquant packed qk head_dim mismatch: q={} arg={}",
+            qd[2],
+            head_dim
+        )
+    }
+    if full_heads % repeat_factor != 0 || full_heads / repeat_factor != kv_heads {
+        candle_core::bail!(
+            "turboquant packed qk invalid head config: full_heads={} kv_heads={} repeat_factor={}",
+            full_heads,
+            kv_heads,
+            repeat_factor
+        )
+    }
+
+    let rows = batch * kv_heads * tokens;
+    let num_subvectors = head_dim / subvector_dim;
+    let code_value_count = rows * head_dim;
+    let packed_code_bytes = (code_value_count * code_bits).div_ceil(8);
+    if packed_codes.elem_count() != packed_code_bytes {
+        candle_core::bail!(
+            "turboquant packed qk codes size mismatch: got {} bytes, expected {}",
+            packed_codes.elem_count(),
+            packed_code_bytes
+        )
+    }
+    if packed_codes.dtype() != DType::U8 {
+        candle_core::bail!(
+            "turboquant packed qk expects U8 packed_codes, got {:?}",
+            packed_codes.dtype()
+        )
+    }
+    let scales_dims = scales.dims();
+    if scales_dims != [rows, num_subvectors] {
+        candle_core::bail!(
+            "turboquant packed qk scales shape mismatch: got {:?}, expected [{}, {}]",
+            scales_dims,
+            rows,
+            num_subvectors
+        )
+    }
+    if !matches!(scales.dtype(), DType::F32 | DType::F16) {
+        candle_core::bail!(
+            "turboquant packed qk expects F32 or F16 scales, got {:?}",
+            scales.dtype()
+        )
+    }
+    let pair_dims = pair_signs.dims();
+    if pair_dims != [head_dim / 2] {
+        candle_core::bail!(
+            "turboquant packed qk pair_signs shape mismatch: got {:?}, expected [{}]",
+            pair_dims,
+            head_dim / 2
+        )
+    }
+    if pair_signs.dtype() != DType::F32 {
+        candle_core::bail!(
+            "turboquant packed qk expects F32 pair_signs, got {:?}",
+            pair_signs.dtype()
+        )
+    }
+    if !q.device().same_device(packed_codes.device())
+        || !q.device().same_device(scales.device())
+        || !q.device().same_device(pair_signs.device())
+    {
+        candle_core::bail!(
+            "turboquant packed qk device mismatch: q={:?}, packed_codes={:?}, scales={:?}, pair_signs={:?}",
+            q.device(),
+            packed_codes.device(),
+            scales.device(),
+            pair_signs.device()
+        )
+    }
+    if let (Some(bits), Some(rscales)) = (&packed_residual_signs, &residual_scales) {
+        let packed_sign_bytes = code_value_count.div_ceil(8);
+        if bits.elem_count() != packed_sign_bytes {
+            candle_core::bail!(
+                "turboquant packed qk residual_signs size mismatch: got {} bytes, expected {}",
+                bits.elem_count(),
+                packed_sign_bytes
+            )
+        }
+        if bits.dtype() != DType::U8 {
+            candle_core::bail!(
+                "turboquant packed qk expects U8 packed_residual_signs, got {:?}",
+                bits.dtype()
+            )
+        }
+        let rscale_dims = rscales.dims();
+        if rscale_dims != [rows, num_subvectors] {
+            candle_core::bail!(
+                "turboquant packed qk residual_scales shape mismatch: got {:?}, expected [{}, {}]",
+                rscale_dims,
+                rows,
+                num_subvectors
+            )
+        }
+        if !matches!(rscales.dtype(), DType::F32 | DType::F16) {
+            candle_core::bail!(
+                "turboquant packed qk expects F32 or F16 residual_scales, got {:?}",
+                rscales.dtype()
+            )
+        }
+        if rscales.dtype() != scales.dtype() {
+            candle_core::bail!(
+                "turboquant packed qk expects residual_scales dtype to match scales dtype (scales={:?}, residual_scales={:?})",
+                scales.dtype(),
+                rscales.dtype()
+            )
+        }
+        if !q.device().same_device(bits.device()) || !q.device().same_device(rscales.device()) {
+            candle_core::bail!(
+                "turboquant packed qk device mismatch for residuals: q={:?}, packed_residual_signs={:?}, residual_scales={:?}",
+                q.device(),
+                bits.device(),
+                rscales.device()
+            )
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    if let Some(out) = try_qk_scores_turboquant_packed_metal(
+        &q,
+        &packed_codes,
+        &scales,
+        &pair_signs,
+        packed_residual_signs.as_ref(),
+        residual_scales.as_ref(),
+        kv_heads,
+        repeat_factor,
+        tokens,
+        head_dim,
+        subvector_dim,
+        code_bits,
+        kind,
+        scale,
+    )? {
+        return Ok(out);
+    }
+
+    cpu_qk_scores_turboquant_packed(
+        &q,
+        &packed_codes,
+        &scales,
+        &pair_signs,
+        packed_residual_signs.as_ref(),
+        residual_scales.as_ref(),
+        kv_heads,
+        repeat_factor,
+        tokens,
+        head_dim,
+        subvector_dim,
+        code_bits,
+        kind,
+        scale,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{attn_weighted_sum, qk_scores, qk_scores_turboquant, TurboQuantKind};
+    use super::{
+        attn_weighted_sum, qk_scores, qk_scores_turboquant, qk_scores_turboquant_packed,
+        TurboQuantKind,
+    };
     use candle_core::{DType, Device, Result, Tensor};
 
     fn assert_close(got: &[f32], expected: &[f32], atol: f32, rtol: f32) {
@@ -2795,6 +3642,24 @@ mod tests {
         ))
     }
 
+    fn pack_values(values: &[u8], bits_per_value: usize) -> Vec<u8> {
+        let total_bits = values.len() * bits_per_value;
+        let mut out = vec![0u8; total_bits.div_ceil(8)];
+        let mask = (1u16 << bits_per_value) - 1;
+        let mut bit_cursor = 0usize;
+        for &value in values {
+            let byte_idx = bit_cursor / 8;
+            let bit_offset = bit_cursor % 8;
+            let val = u16::from(value) & mask;
+            out[byte_idx] |= (val << bit_offset) as u8;
+            if bit_offset + bits_per_value > 8 {
+                out[byte_idx + 1] |= (val >> (8 - bit_offset)) as u8;
+            }
+            bit_cursor += bits_per_value;
+        }
+        out
+    }
+
     #[test]
     fn qk_scores_turboquant_cpu_matches_reference() -> Result<()> {
         let device = Device::Cpu;
@@ -2844,6 +3709,111 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn qk_scores_turboquant_packed_cpu_matches_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let (q, codes, scales, pair_signs, residual_signs, residual_scales) =
+            turbo_case_tensors(&device)?;
+        let packed_codes = Tensor::from_vec(
+            pack_values(&codes.flatten_all()?.to_vec1::<u8>()?, 3),
+            (3usize,),
+            &device,
+        )?;
+        let packed_residual_signs = Tensor::from_vec(
+            pack_values(&residual_signs.flatten_all()?.to_vec1::<u8>()?, 1),
+            (1usize,),
+            &device,
+        )?;
+        let out = qk_scores_turboquant_packed(
+            &q,
+            &packed_codes,
+            &scales,
+            &pair_signs,
+            Some(&packed_residual_signs),
+            Some(&residual_scales),
+            1,
+            2,
+            2,
+            4,
+            2,
+            3,
+            TurboQuantKind::Turbo3,
+            0.5,
+        )?;
+        let out = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let q_vec = q.flatten_all()?.to_vec1::<f32>()?;
+        let codes_vec = codes.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.flatten_all()?.to_vec1::<f32>()?;
+        let pair_vec = pair_signs.flatten_all()?.to_vec1::<f32>()?;
+        let residual_bits_vec = residual_signs.flatten_all()?.to_vec1::<u8>()?;
+        let residual_scales_vec = residual_scales.flatten_all()?.to_vec1::<f32>()?;
+        let expected = super::cpu_qk_scores_turboquant_impl(
+            &q_vec,
+            |v| v,
+            &codes_vec,
+            &scales_vec,
+            &pair_vec,
+            Some(&residual_bits_vec),
+            Some(&residual_scales_vec),
+            1,
+            2,
+            1,
+            2,
+            2,
+            4,
+            2,
+            TurboQuantKind::Turbo3.signed_max(),
+            0.5,
+        );
+        assert_close(&out, &expected, 1e-5, 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn qk_scores_turboquant_cpu_accepts_f16_scales() -> Result<()> {
+        let device = Device::Cpu;
+        let (q, codes, scales, pair_signs, residual_signs, residual_scales) =
+            turbo_case_tensors(&device)?;
+        let expected = qk_scores_turboquant(
+            &q,
+            &codes,
+            &scales,
+            &pair_signs,
+            Some(&residual_signs),
+            Some(&residual_scales),
+            1,
+            2,
+            2,
+            4,
+            2,
+            TurboQuantKind::Turbo3,
+            0.5,
+        )?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        let got = qk_scores_turboquant(
+            &q,
+            &codes,
+            &scales.to_dtype(DType::F16)?,
+            &pair_signs,
+            Some(&residual_signs),
+            Some(&residual_scales.to_dtype(DType::F16)?),
+            1,
+            2,
+            2,
+            4,
+            2,
+            TurboQuantKind::Turbo3,
+            0.5,
+        )?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        assert_close(&got, &expected, 1e-3, 1e-3);
+        Ok(())
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn qk_scores_turboquant_metal_matches_cpu() -> Result<()> {
@@ -2877,15 +3847,89 @@ mod tests {
         let got = qk_scores_turboquant(
             &q.to_dtype(DType::F16)?,
             &codes,
-            &scales,
+            &scales.to_dtype(DType::F16)?,
             &pair_signs,
             Some(&residual_signs),
-            Some(&residual_scales),
+            Some(&residual_scales.to_dtype(DType::F16)?),
             1,
             2,
             2,
             4,
             2,
+            TurboQuantKind::Turbo3,
+            0.5,
+        )?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        assert_close(&got, &expected, 1e-3, 1e-3);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qk_scores_turboquant_packed_metal_matches_cpu() -> Result<()> {
+        let metal = match Device::metal_if_available(0) {
+            Ok(d) if !d.is_cpu() => d,
+            _ => return Ok(()),
+        };
+        let cpu = Device::Cpu;
+        let (q_cpu, codes_cpu, scales_cpu, pair_cpu, residual_bits_cpu, residual_scales_cpu) =
+            turbo_case_tensors(&cpu)?;
+        let packed_codes_cpu = Tensor::from_vec(
+            pack_values(&codes_cpu.flatten_all()?.to_vec1::<u8>()?, 3),
+            (3usize,),
+            &cpu,
+        )?;
+        let packed_residuals_cpu = Tensor::from_vec(
+            pack_values(&residual_bits_cpu.flatten_all()?.to_vec1::<u8>()?, 1),
+            (1usize,),
+            &cpu,
+        )?;
+        let expected = qk_scores_turboquant_packed(
+            &q_cpu,
+            &packed_codes_cpu,
+            &scales_cpu,
+            &pair_cpu,
+            Some(&packed_residuals_cpu),
+            Some(&residual_scales_cpu),
+            1,
+            2,
+            2,
+            4,
+            2,
+            3,
+            TurboQuantKind::Turbo3,
+            0.5,
+        )?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        let (q, codes, scales, pair_signs, residual_signs, residual_scales) =
+            turbo_case_tensors(&metal)?;
+        let packed_codes = Tensor::from_vec(
+            pack_values(&codes.flatten_all()?.to_vec1::<u8>()?, 3),
+            (3usize,),
+            &metal,
+        )?;
+        let packed_residuals = Tensor::from_vec(
+            pack_values(&residual_signs.flatten_all()?.to_vec1::<u8>()?, 1),
+            (1usize,),
+            &metal,
+        )?;
+        let got = qk_scores_turboquant_packed(
+            &q.to_dtype(DType::F16)?,
+            &packed_codes,
+            &scales.to_dtype(DType::F16)?,
+            &pair_signs,
+            Some(&packed_residuals),
+            Some(&residual_scales.to_dtype(DType::F16)?),
+            1,
+            2,
+            2,
+            4,
+            2,
+            3,
             TurboQuantKind::Turbo3,
             0.5,
         )?
