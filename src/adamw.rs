@@ -35,10 +35,13 @@ struct AdamWMetalDeviceCache {
 type AdamWMetalDeviceId = candle_core::metal_backend::DeviceId;
 
 #[cfg(feature = "metal")]
-static ADAMW_METAL_CACHE: OnceLock<RwLock<HashMap<AdamWMetalDeviceId, AdamWMetalDeviceCache>>> = OnceLock::new();
+static ADAMW_METAL_CACHE: OnceLock<RwLock<HashMap<AdamWMetalDeviceId, AdamWMetalDeviceCache>>> =
+    OnceLock::new();
 
 impl AdamWPackedUpdateOp {
-    fn cpu_grad_storage<'a>(&'a self) -> Result<(std::sync::RwLockReadGuard<'a, Storage>, &'a Layout)> {
+    fn cpu_grad_storage<'a>(
+        &'a self,
+    ) -> Result<(std::sync::RwLockReadGuard<'a, Storage>, &'a Layout)> {
         let (storage, layout) = self.grad.storage_and_layout();
         Ok((storage, layout))
     }
@@ -61,10 +64,14 @@ fn get_or_create_adamw_pipeline(
         let func = dev_cache
             .library
             .get_function(kernel_name, None)
-            .map_err(|e| candle_core::Error::msg(format!("failed loading adamw metal function: {e}")))?;
+            .map_err(|e| {
+                candle_core::Error::msg(format!("failed loading adamw metal function: {e}"))
+            })?;
         let pipeline = device
             .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::msg(format!("failed creating adamw metal pipeline: {e}")))?;
+            .map_err(|e| {
+                candle_core::Error::msg(format!("failed creating adamw metal pipeline: {e}"))
+            })?;
         dev_cache.pipelines.insert(kernel_name, pipeline.clone());
         return Ok(pipeline);
     }
@@ -72,27 +79,29 @@ fn get_or_create_adamw_pipeline(
     let options = objc2_metal::MTLCompileOptions::new();
     let library = device
         .new_library_with_source(ADAMW_PACK_METAL, Some(&options))
-        .map_err(|e| candle_core::Error::msg(format!("failed compiling adamw metal source: {e}")))?;
-    let func = library
-        .get_function(kernel_name, None)
-        .map_err(|e| candle_core::Error::msg(format!("failed loading adamw metal function: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed compiling adamw metal source: {e}"))
+        })?;
+    let func = library.get_function(kernel_name, None).map_err(|e| {
+        candle_core::Error::msg(format!("failed loading adamw metal function: {e}"))
+    })?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| candle_core::Error::msg(format!("failed creating adamw metal pipeline: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed creating adamw metal pipeline: {e}"))
+        })?;
 
     let mut pipelines = HashMap::new();
     pipelines.insert(kernel_name, pipeline.clone());
-    cache.insert(
-        device_id,
-        AdamWMetalDeviceCache {
-            library,
-            pipelines,
-        },
-    );
+    cache.insert(device_id, AdamWMetalDeviceCache { library, pipelines });
     Ok(pipeline)
 }
 
-fn contiguous_slice<'a, T>(values: &'a [T], layout: &Layout, name: &'static str) -> Result<&'a [T]> {
+fn contiguous_slice<'a, T>(
+    values: &'a [T],
+    layout: &Layout,
+    name: &'static str,
+) -> Result<&'a [T]> {
     match layout.contiguous_offsets() {
         Some((start, end)) => Ok(&values[start..end]),
         None => candle_core::bail!("{name} must be contiguous for fused AdamW op"),
@@ -155,7 +164,8 @@ fn cpu_pack_f16(
         let next_v = beta2 * v[i].to_f32() + one_minus_beta2 * gi * gi;
         let m_hat = next_m * scale_m;
         let v_hat = next_v * scale_v;
-        let next_theta = one_minus_lr_lambda * theta[i].to_f32() - lr * (m_hat / (v_hat.sqrt() + eps));
+        let next_theta =
+            one_minus_lr_lambda * theta[i].to_f32() - lr * (m_hat / (v_hat.sqrt() + eps));
         out[i] = f16::from_f32(next_m);
         out[i + n] = f16::from_f32(next_v);
         out[i + 2 * n] = f16::from_f32(next_theta);
@@ -187,7 +197,8 @@ fn cpu_pack_bf16(
         let next_v = beta2 * v[i].to_f32() + one_minus_beta2 * gi * gi;
         let m_hat = next_m * scale_m;
         let v_hat = next_v * scale_v;
-        let next_theta = one_minus_lr_lambda * theta[i].to_f32() - lr * (m_hat / (v_hat.sqrt() + eps));
+        let next_theta =
+            one_minus_lr_lambda * theta[i].to_f32() - lr * (m_hat / (v_hat.sqrt() + eps));
         out[i] = bf16::from_f32(next_m);
         out[i + n] = bf16::from_f32(next_v);
         out[i + 2 * n] = bf16::from_f32(next_theta);
@@ -219,7 +230,12 @@ impl CustomOp3 for AdamWPackedUpdateOp {
         }
         let shape = Shape::from((3, elem_count));
         match (s1, s2, s3, &*g_storage) {
-            (CpuStorage::F32(theta), CpuStorage::F32(m), CpuStorage::F32(v), Storage::Cpu(CpuStorage::F32(g))) => {
+            (
+                CpuStorage::F32(theta),
+                CpuStorage::F32(m),
+                CpuStorage::F32(v),
+                Storage::Cpu(CpuStorage::F32(g)),
+            ) => {
                 let theta = contiguous_slice(theta, l1, "theta")?;
                 let m = contiguous_slice(m, l2, "first_moment")?;
                 let v = contiguous_slice(v, l3, "second_moment")?;
@@ -227,7 +243,12 @@ impl CustomOp3 for AdamWPackedUpdateOp {
                 let out = cpu_pack_f32(theta, m, v, g, self.params);
                 Ok((CpuStorage::F32(out), shape))
             }
-            (CpuStorage::F16(theta), CpuStorage::F16(m), CpuStorage::F16(v), Storage::Cpu(CpuStorage::F16(g))) => {
+            (
+                CpuStorage::F16(theta),
+                CpuStorage::F16(m),
+                CpuStorage::F16(v),
+                Storage::Cpu(CpuStorage::F16(g)),
+            ) => {
                 let theta = contiguous_slice(theta, l1, "theta")?;
                 let m = contiguous_slice(m, l2, "first_moment")?;
                 let v = contiguous_slice(v, l3, "second_moment")?;
@@ -235,7 +256,12 @@ impl CustomOp3 for AdamWPackedUpdateOp {
                 let out = cpu_pack_f16(theta, m, v, g, self.params);
                 Ok((CpuStorage::F16(out), shape))
             }
-            (CpuStorage::BF16(theta), CpuStorage::BF16(m), CpuStorage::BF16(v), Storage::Cpu(CpuStorage::BF16(g))) => {
+            (
+                CpuStorage::BF16(theta),
+                CpuStorage::BF16(m),
+                CpuStorage::BF16(v),
+                Storage::Cpu(CpuStorage::BF16(g)),
+            ) => {
                 let theta = contiguous_slice(theta, l1, "theta")?;
                 let m = contiguous_slice(m, l2, "first_moment")?;
                 let v = contiguous_slice(v, l3, "second_moment")?;
@@ -267,7 +293,11 @@ impl CustomOp3 for AdamWPackedUpdateOp {
             _ => candle_core::bail!("grad tensor must be on metal for metal fused AdamW op"),
         };
 
-        if !l1.is_contiguous() || !l2.is_contiguous() || !l3.is_contiguous() || !g_layout.is_contiguous() {
+        if !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+            || !g_layout.is_contiguous()
+        {
             candle_core::bail!("fused AdamW op expects contiguous layouts");
         }
 
@@ -308,7 +338,9 @@ impl CustomOp3 for AdamWPackedUpdateOp {
         let metal = s1.device().metal_device();
         let pipeline = get_or_create_adamw_pipeline(s1.device().id(), metal, kernel_name)?;
 
-        let output = s1.device().new_buffer(3 * elem_count, dtype, "adamw-packed-out")?;
+        let output = s1
+            .device()
+            .new_buffer(3 * elem_count, dtype, "adamw-packed-out")?;
         let encoder = s1.device().command_encoder()?;
         encoder.set_label("candelora_adamw_pack");
         encoder.set_compute_pipeline_state(&pipeline);
@@ -413,7 +445,12 @@ pub fn adamw_step_in_place(
     params: AdamWStepParams,
 ) -> Result<bool> {
     if std::env::var("CANDLORA_DISABLE_FUSED_ADAMW_METAL")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
         .unwrap_or(false)
     {
         return Ok(false);
@@ -429,7 +466,10 @@ pub fn adamw_step_in_place(
     {
         return Ok(false);
     }
-    if theta_t.dtype() != m_t.dtype() || theta_t.dtype() != v_t.dtype() || theta_t.dtype() != grad.dtype() {
+    if theta_t.dtype() != m_t.dtype()
+        || theta_t.dtype() != v_t.dtype()
+        || theta_t.dtype() != grad.dtype()
+    {
         return Ok(false);
     }
     match theta_t.dtype() {
@@ -483,7 +523,13 @@ mod tests {
         }
     }
 
-    fn reference_adamw(theta: &[f32], m: &[f32], v: &[f32], g: &[f32], p: AdamWStepParams) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn reference_adamw(
+        theta: &[f32],
+        m: &[f32],
+        v: &[f32],
+        g: &[f32],
+        p: AdamWStepParams,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut next_m = vec![0f32; theta.len()];
         let mut next_v = vec![0f32; theta.len()];
         let mut next_theta = vec![0f32; theta.len()];
@@ -561,7 +607,8 @@ mod tests {
         params: AdamWStepParams,
     ) -> Result<()> {
         let next_m = ((first_moment.as_tensor() * params.beta1)? + (grad * (1.0 - params.beta1))?)?;
-        let next_v = ((second_moment.as_tensor() * params.beta2)? + (grad.sqr()? * (1.0 - params.beta2))?)?;
+        let next_v =
+            ((second_moment.as_tensor() * params.beta2)? + (grad.sqr()? * (1.0 - params.beta2))?)?;
         let m_hat = (&next_m * params.scale_m)?;
         let v_hat = (&next_v * params.scale_v)?;
         let next_theta = (theta.as_tensor() * (1f64 - params.lr_lambda))?;
@@ -582,15 +629,18 @@ mod tests {
     ) -> Result<()> {
         let len = shape.0 * shape.1;
         let theta = Tensor::from_vec(make_theta(len), shape, device)?.to_dtype(dtype)?;
-        let first_moment = Tensor::from_vec(make_first_moment(len), shape, device)?.to_dtype(dtype)?;
-        let second_moment = Tensor::from_vec(make_second_moment(len), shape, device)?.to_dtype(dtype)?;
+        let first_moment =
+            Tensor::from_vec(make_first_moment(len), shape, device)?.to_dtype(dtype)?;
+        let second_moment =
+            Tensor::from_vec(make_second_moment(len), shape, device)?.to_dtype(dtype)?;
         let grad = Tensor::from_vec(make_grad(len, 0), shape, device)?.to_dtype(dtype)?;
         let params = params_for_step(0);
         let theta_ref = tensor_to_f32_vec(&theta)?;
         let m_ref = tensor_to_f32_vec(&first_moment)?;
         let v_ref = tensor_to_f32_vec(&second_moment)?;
         let g_ref = tensor_to_f32_vec(&grad)?;
-        let (m_expected, v_expected, theta_expected) = reference_adamw(&theta_ref, &m_ref, &v_ref, &g_ref, params);
+        let (m_expected, v_expected, theta_expected) =
+            reference_adamw(&theta_ref, &m_ref, &v_ref, &g_ref, params);
 
         let packed = adamw_packed_update(&theta, &first_moment, &second_moment, &grad, params)?;
         let packed = tensor_to_f32_vec(&packed)?;
@@ -626,7 +676,10 @@ mod tests {
             let params = params_for_step(step);
             let grad = Tensor::from_vec(make_grad(len, step), shape, device)?.to_dtype(dtype)?;
             let fused_used = adamw_step_in_place(&fused_theta, &fused_m, &fused_v, &grad, params)?;
-            assert!(fused_used, "expected fused AdamW path to run for dtype={dtype:?} shape={shape:?}");
+            assert!(
+                fused_used,
+                "expected fused AdamW path to run for dtype={dtype:?} shape={shape:?}"
+            );
             unfused_step_in_place(&unfused_theta, &unfused_m, &unfused_v, &grad, params)?;
 
             let fused_m_vals = tensor_to_f32_vec(fused_m.as_tensor())?;

@@ -1,8 +1,8 @@
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 #[cfg(feature = "metal")]
 use candle_core::DType;
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
@@ -66,7 +66,9 @@ fn get_or_create_axpy_pipeline(
         .map_err(|e| candle_core::Error::msg(format!("failed loading axpy metal function: {e}")))?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| candle_core::Error::msg(format!("failed creating axpy metal pipeline: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed creating axpy metal pipeline: {e}"))
+        })?;
 
     let mut pipelines = HashMap::new();
     pipelines.insert(kernel_name, pipeline.clone());
@@ -74,7 +76,11 @@ fn get_or_create_axpy_pipeline(
     Ok(pipeline)
 }
 
-fn contiguous_slice<'a, T>(values: &'a [T], layout: &Layout, name: &'static str) -> Result<&'a [T]> {
+fn contiguous_slice<'a, T>(
+    values: &'a [T],
+    layout: &Layout,
+    name: &'static str,
+) -> Result<&'a [T]> {
     match layout.contiguous_offsets() {
         Some((start, end)) => Ok(&values[start..end]),
         None => candle_core::bail!("{name} must be contiguous for fused axpy op"),

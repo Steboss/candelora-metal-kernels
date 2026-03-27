@@ -1,7 +1,9 @@
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout, Module, Result, Shape, Tensor};
 use candle_core::quantized::{QMatMul, QTensor};
+use candle_core::{
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout, Module, Result, Shape, Tensor,
+};
 use half::{bf16, f16};
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
@@ -84,10 +86,14 @@ fn get_or_create_kv_attn_pipeline(
         let func = dev_cache
             .library
             .get_function(kernel_name, None)
-            .map_err(|e| candle_core::Error::msg(format!("failed loading kv-attn metal function: {e}")))?;
+            .map_err(|e| {
+                candle_core::Error::msg(format!("failed loading kv-attn metal function: {e}"))
+            })?;
         let pipeline = device
             .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::msg(format!("failed creating kv-attn metal pipeline: {e}")))?;
+            .map_err(|e| {
+                candle_core::Error::msg(format!("failed creating kv-attn metal pipeline: {e}"))
+            })?;
         dev_cache.pipelines.insert(kernel_name, pipeline.clone());
         return Ok(pipeline);
     }
@@ -95,13 +101,17 @@ fn get_or_create_kv_attn_pipeline(
     let options = objc2_metal::MTLCompileOptions::new();
     let library = device
         .new_library_with_source(KV_ATTN_METAL, Some(&options))
-        .map_err(|e| candle_core::Error::msg(format!("failed compiling kv-attn metal source: {e}")))?;
-    let func = library
-        .get_function(kernel_name, None)
-        .map_err(|e| candle_core::Error::msg(format!("failed loading kv-attn metal function: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed compiling kv-attn metal source: {e}"))
+        })?;
+    let func = library.get_function(kernel_name, None).map_err(|e| {
+        candle_core::Error::msg(format!("failed loading kv-attn metal function: {e}"))
+    })?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| candle_core::Error::msg(format!("failed creating kv-attn metal pipeline: {e}")))?;
+        .map_err(|e| {
+            candle_core::Error::msg(format!("failed creating kv-attn metal pipeline: {e}"))
+        })?;
 
     let mut pipelines = HashMap::new();
     pipelines.insert(kernel_name, pipeline.clone());
@@ -109,7 +119,11 @@ fn get_or_create_kv_attn_pipeline(
     Ok(pipeline)
 }
 
-fn contiguous_slice<'a, T>(values: &'a [T], layout: &Layout, name: &'static str) -> Result<&'a [T]> {
+fn contiguous_slice<'a, T>(
+    values: &'a [T],
+    layout: &Layout,
+    name: &'static str,
+) -> Result<&'a [T]> {
     match layout.contiguous_offsets() {
         Some((start, end)) => Ok(&values[start..end]),
         None => candle_core::bail!("{name} must be contiguous for fused kv-attn op"),
@@ -128,9 +142,7 @@ fn parse_qk_shapes(l1: &Layout, l2: &Layout) -> Result<(usize, usize, usize, usi
     let (b, h, d) = (qd[0], qd[1], qd[2]);
     let (bk, hk, t, dk) = (kd[0], kd[1], kd[2], kd[3]);
     if b != bk || h != hk || d != dk {
-        candle_core::bail!(
-            "q/k shape mismatch: q=[{b},{h},{d}], k=[{bk},{hk},{t},{dk}]"
-        )
+        candle_core::bail!("q/k shape mismatch: q=[{b},{h},{d}], k=[{bk},{hk},{t},{dk}]")
     }
     Ok((b, h, t, d))
 }
@@ -147,14 +159,20 @@ fn parse_attn_v_shapes(l1: &Layout, l2: &Layout) -> Result<(usize, usize, usize,
     let (b, h, t) = (ad[0], ad[1], ad[2]);
     let (bv, hv, tv, d) = (vd[0], vd[1], vd[2], vd[3]);
     if b != bv || h != hv || t != tv {
-        candle_core::bail!(
-            "attn/v shape mismatch: attn=[{b},{h},{t}], v=[{bv},{hv},{tv},{d}]"
-        )
+        candle_core::bail!("attn/v shape mismatch: attn=[{b},{h},{t}], v=[{bv},{hv},{tv},{d}]")
     }
     Ok((b, h, t, d))
 }
 
-fn cpu_qk_scores_f32(q: &[f32], k: &[f32], b: usize, h: usize, t: usize, d: usize, scale: f32) -> Vec<f32> {
+fn cpu_qk_scores_f32(
+    q: &[f32],
+    k: &[f32],
+    b: usize,
+    h: usize,
+    t: usize,
+    d: usize,
+    scale: f32,
+) -> Vec<f32> {
     let bh = b * h;
     let mut out = vec![0f32; bh * t];
     for bh_idx in 0..bh {
@@ -171,7 +189,15 @@ fn cpu_qk_scores_f32(q: &[f32], k: &[f32], b: usize, h: usize, t: usize, d: usiz
     out
 }
 
-fn cpu_qk_scores_f16(q: &[f16], k: &[f16], b: usize, h: usize, t: usize, d: usize, scale: f32) -> Vec<f32> {
+fn cpu_qk_scores_f16(
+    q: &[f16],
+    k: &[f16],
+    b: usize,
+    h: usize,
+    t: usize,
+    d: usize,
+    scale: f32,
+) -> Vec<f32> {
     let bh = b * h;
     let mut out = vec![0f32; bh * t];
     for bh_idx in 0..bh {
@@ -213,7 +239,14 @@ fn cpu_qk_scores_bf16(
     out
 }
 
-fn cpu_attn_weighted_sum_f32(attn: &[f32], v: &[f32], b: usize, h: usize, t: usize, d: usize) -> Vec<f32> {
+fn cpu_attn_weighted_sum_f32(
+    attn: &[f32],
+    v: &[f32],
+    b: usize,
+    h: usize,
+    t: usize,
+    d: usize,
+) -> Vec<f32> {
     let bh = b * h;
     let mut out = vec![0f32; bh * d];
     for bh_idx in 0..bh {
@@ -230,7 +263,14 @@ fn cpu_attn_weighted_sum_f32(attn: &[f32], v: &[f32], b: usize, h: usize, t: usi
     out
 }
 
-fn cpu_attn_weighted_sum_f16(attn: &[f32], v: &[f16], b: usize, h: usize, t: usize, d: usize) -> Vec<f32> {
+fn cpu_attn_weighted_sum_f16(
+    attn: &[f32],
+    v: &[f16],
+    b: usize,
+    h: usize,
+    t: usize,
+    d: usize,
+) -> Vec<f32> {
     let bh = b * h;
     let mut out = vec![0f32; bh * d];
     for bh_idx in 0..bh {
@@ -278,7 +318,13 @@ fn expected_packed_cols(head_dim: usize, kind: RowwiseQuantKind) -> usize {
     }
 }
 
-fn dequant_row_elem(data: &[u8], row: usize, col: usize, head_dim: usize, kind: RowwiseQuantKind) -> f32 {
+fn dequant_row_elem(
+    data: &[u8],
+    row: usize,
+    col: usize,
+    head_dim: usize,
+    kind: RowwiseQuantKind,
+) -> f32 {
     match kind {
         RowwiseQuantKind::Int8 => {
             let idx = row * head_dim + col;
@@ -320,7 +366,12 @@ fn parse_rowwise_pack_input(l: &Layout, head_dim: usize, name: &'static str) -> 
     Ok(l.shape().elem_count() / head_dim)
 }
 
-fn cpu_pack_scales_rowwise_f32(x: &[f32], rows: usize, head_dim: usize, kind: RowwiseQuantKind) -> Vec<f32> {
+fn cpu_pack_scales_rowwise_f32(
+    x: &[f32],
+    rows: usize,
+    head_dim: usize,
+    kind: RowwiseQuantKind,
+) -> Vec<f32> {
     let denom = match kind {
         RowwiseQuantKind::Int8 => 127.0f32,
         RowwiseQuantKind::Int4 => 7.0f32,
@@ -342,7 +393,12 @@ fn cpu_pack_scales_rowwise_f32(x: &[f32], rows: usize, head_dim: usize, kind: Ro
     scales
 }
 
-fn cpu_pack_scales_rowwise_f16(x: &[f16], rows: usize, head_dim: usize, kind: RowwiseQuantKind) -> Vec<f32> {
+fn cpu_pack_scales_rowwise_f16(
+    x: &[f16],
+    rows: usize,
+    head_dim: usize,
+    kind: RowwiseQuantKind,
+) -> Vec<f32> {
     let xf = x.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
     cpu_pack_scales_rowwise_f32(&xf, rows, head_dim, kind)
 }
@@ -592,7 +648,9 @@ impl CustomOp1 for RowwisePackScalesOp {
         }
         let rows = parse_rowwise_pack_input(l1, self.head_dim, "x")?;
         if rows == 0 {
-            let out = s1.device().new_buffer(0, DType::F32, "kv-attn-pack-scales-out")?;
+            let out = s1
+                .device()
+                .new_buffer(0, DType::F32, "kv-attn-pack-scales-out")?;
             return Ok((
                 candle_core::MetalStorage::new(out, s1.device().clone(), 0, DType::F32),
                 Shape::from(0usize),
@@ -613,9 +671,10 @@ impl CustomOp1 for RowwisePackScalesOp {
             RowwiseQuantKind::Int4 => 7.0f32,
         };
 
-        let rows_u32 = u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
-        let d_u32 =
-            u32::try_from(self.head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let rows_u32 =
+            u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
+        let d_u32 = u32::try_from(self.head_dim)
+            .map_err(|_| candle_core::Error::msg("head_dim too large"))?;
         let metal = s1.device().metal_device();
         let pipeline = get_or_create_kv_attn_pipeline(s1.device().id(), metal, kernel_name)?;
         let output = s1
@@ -636,7 +695,9 @@ impl CustomOp1 for RowwisePackScalesOp {
         let encoder_ref = &encoder;
         candle_metal_kernels::set_params!(encoder_ref, (rows_u32, d_u32, denom, &x, &out));
 
-        let threads = pipeline.max_total_threads_per_threadgroup().min(rows.max(1));
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(rows.max(1));
         let groups = rows.div_ceil(threads);
         let tg_count = MTLSize {
             width: groups,
@@ -683,15 +744,27 @@ impl CustomOp2 for RowwisePackDataOp {
             _ => candle_core::bail!("rowwise pack data expects F32 scales"),
         };
         let out = match s1 {
-            CpuStorage::F32(x) => {
-                cpu_pack_data_rowwise_f32(contiguous_slice(x, l1, "x")?, scales, rows, self.head_dim, self.kind)
-            }
-            CpuStorage::F16(x) => {
-                cpu_pack_data_rowwise_f16(contiguous_slice(x, l1, "x")?, scales, rows, self.head_dim, self.kind)
-            }
-            CpuStorage::BF16(x) => {
-                cpu_pack_data_rowwise_bf16(contiguous_slice(x, l1, "x")?, scales, rows, self.head_dim, self.kind)
-            }
+            CpuStorage::F32(x) => cpu_pack_data_rowwise_f32(
+                contiguous_slice(x, l1, "x")?,
+                scales,
+                rows,
+                self.head_dim,
+                self.kind,
+            ),
+            CpuStorage::F16(x) => cpu_pack_data_rowwise_f16(
+                contiguous_slice(x, l1, "x")?,
+                scales,
+                rows,
+                self.head_dim,
+                self.kind,
+            ),
+            CpuStorage::BF16(x) => cpu_pack_data_rowwise_bf16(
+                contiguous_slice(x, l1, "x")?,
+                scales,
+                rows,
+                self.head_dim,
+                self.kind,
+            ),
             _ => candle_core::bail!("rowwise pack data only supports F32/F16/BF16 inputs"),
         };
         let packed_cols = expected_packed_cols(self.head_dim, self.kind);
@@ -728,7 +801,9 @@ impl CustomOp2 for RowwisePackDataOp {
             )
         }
         if rows == 0 {
-            let out = s1.device().new_buffer(0, DType::U8, "kv-attn-pack-data-out")?;
+            let out = s1
+                .device()
+                .new_buffer(0, DType::U8, "kv-attn-pack-data-out")?;
             return Ok((
                 candle_core::MetalStorage::new(out, s1.device().clone(), 0, DType::U8),
                 Shape::from((0usize, expected_packed_cols(self.head_dim, self.kind))),
@@ -746,9 +821,10 @@ impl CustomOp2 for RowwisePackDataOp {
         };
         let packed_cols = expected_packed_cols(self.head_dim, self.kind);
         let out_elems = rows * packed_cols;
-        let rows_u32 = u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
-        let d_u32 =
-            u32::try_from(self.head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let rows_u32 =
+            u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
+        let d_u32 = u32::try_from(self.head_dim)
+            .map_err(|_| candle_core::Error::msg("head_dim too large"))?;
         let metal = s1.device().metal_device();
         let pipeline = get_or_create_kv_attn_pipeline(s1.device().id(), metal, kernel_name)?;
         let output = s1
@@ -773,7 +849,9 @@ impl CustomOp2 for RowwisePackDataOp {
         let encoder_ref = &encoder;
         candle_metal_kernels::set_params!(encoder_ref, (rows_u32, d_u32, &x, &scales, &out));
 
-        let threads = pipeline.max_total_threads_per_threadgroup().min(rows.max(1));
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(rows.max(1));
         let groups = rows.div_ceil(threads);
         let tg_count = MTLSize {
             width: groups,
@@ -812,17 +890,26 @@ impl CustomOp2 for QkScoresOp {
             (CpuStorage::F32(q), CpuStorage::F32(k)) => {
                 let q = contiguous_slice(q, l1, "q")?;
                 let k = contiguous_slice(k, l2, "k")?;
-                Ok((CpuStorage::F32(cpu_qk_scores_f32(q, k, b, h, t, d, self.scale)), out_shape))
+                Ok((
+                    CpuStorage::F32(cpu_qk_scores_f32(q, k, b, h, t, d, self.scale)),
+                    out_shape,
+                ))
             }
             (CpuStorage::F16(q), CpuStorage::F16(k)) => {
                 let q = contiguous_slice(q, l1, "q")?;
                 let k = contiguous_slice(k, l2, "k")?;
-                Ok((CpuStorage::F32(cpu_qk_scores_f16(q, k, b, h, t, d, self.scale)), out_shape))
+                Ok((
+                    CpuStorage::F32(cpu_qk_scores_f16(q, k, b, h, t, d, self.scale)),
+                    out_shape,
+                ))
             }
             (CpuStorage::BF16(q), CpuStorage::BF16(k)) => {
                 let q = contiguous_slice(q, l1, "q")?;
                 let k = contiguous_slice(k, l2, "k")?;
-                Ok((CpuStorage::F32(cpu_qk_scores_bf16(q, k, b, h, t, d, self.scale)), out_shape))
+                Ok((
+                    CpuStorage::F32(cpu_qk_scores_bf16(q, k, b, h, t, d, self.scale)),
+                    out_shape,
+                ))
             }
             _ => candle_core::bail!("unsupported dtype combination for fused kv-attn qk op"),
         }
@@ -859,7 +946,11 @@ impl CustomOp2 for QkScoresOp {
 
         let dtype = s1.dtype();
         if dtype != s2.dtype() {
-            candle_core::bail!("dtype mismatch in fused kv-attn qk op: q={:?}, k={:?}", dtype, s2.dtype());
+            candle_core::bail!(
+                "dtype mismatch in fused kv-attn qk op: q={:?}, k={:?}",
+                dtype,
+                s2.dtype()
+            );
         }
         let kernel_name = match dtype {
             DType::F32 => "qk_scores_f32",
@@ -895,7 +986,10 @@ impl CustomOp2 for QkScoresOp {
         };
 
         let encoder_ref = &encoder;
-        candle_metal_kernels::set_params!(encoder_ref, (bh_u32, t_u32, d_u32, self.scale, &q, &k, &out));
+        candle_metal_kernels::set_params!(
+            encoder_ref,
+            (bh_u32, t_u32, d_u32, self.scale, &q, &k, &out)
+        );
 
         let threads = pipeline
             .max_total_threads_per_threadgroup()
@@ -1211,7 +1305,8 @@ impl CustomOp3 for RowwiseQkScoresOp {
         if d != self.head_dim {
             candle_core::bail!("rowwise qk head_dim mismatch: q={} op={}", d, self.head_dim)
         }
-        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads {
+        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads
+        {
             candle_core::bail!(
                 "rowwise qk invalid head config: full_heads={} kv_heads={} repeat_factor={}",
                 full_heads,
@@ -1261,22 +1356,27 @@ impl CustomOp3 for RowwiseQkScoresOp {
         let out_elems = bh_full * self.tokens;
         let out_shape = Shape::from((b, full_heads, self.tokens));
         if out_elems == 0 {
-            let out = s1.device().new_buffer(0, DType::F32, "kv-attn-rowwise-qk-out")?;
+            let out = s1
+                .device()
+                .new_buffer(0, DType::F32, "kv-attn-rowwise-qk-out")?;
             return Ok((
                 candle_core::MetalStorage::new(out, s1.device().clone(), 0, DType::F32),
                 out_shape,
             ));
         }
 
-        let bh_u32 = u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
-        let full_heads_u32 =
-            u32::try_from(full_heads).map_err(|_| candle_core::Error::msg("full_heads too large"))?;
-        let kv_heads_u32 =
-            u32::try_from(self.kv_heads).map_err(|_| candle_core::Error::msg("kv_heads too large"))?;
+        let bh_u32 =
+            u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
+        let full_heads_u32 = u32::try_from(full_heads)
+            .map_err(|_| candle_core::Error::msg("full_heads too large"))?;
+        let kv_heads_u32 = u32::try_from(self.kv_heads)
+            .map_err(|_| candle_core::Error::msg("kv_heads too large"))?;
         let repeat_u32 = u32::try_from(self.repeat_factor)
             .map_err(|_| candle_core::Error::msg("repeat_factor too large"))?;
-        let t_u32 = u32::try_from(self.tokens).map_err(|_| candle_core::Error::msg("tokens too large"))?;
-        let d_u32 = u32::try_from(self.head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let t_u32 =
+            u32::try_from(self.tokens).map_err(|_| candle_core::Error::msg("tokens too large"))?;
+        let d_u32 = u32::try_from(self.head_dim)
+            .map_err(|_| candle_core::Error::msg("head_dim too large"))?;
 
         let metal = s1.device().metal_device();
         let pipeline = get_or_create_kv_attn_pipeline(s1.device().id(), metal, kernel_name)?;
@@ -1360,13 +1460,21 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
     ) -> Result<(CpuStorage, Shape)> {
         let ad = l1.shape().dims();
         if ad.len() != 3 {
-            candle_core::bail!("rowwise weighted-sum expects attn rank-3 [b,h,t], got {:?}", ad)
+            candle_core::bail!(
+                "rowwise weighted-sum expects attn rank-3 [b,h,t], got {:?}",
+                ad
+            )
         }
         let (b, full_heads, t) = (ad[0], ad[1], ad[2]);
         if t != self.tokens {
-            candle_core::bail!("rowwise weighted-sum token mismatch: attn={} op={}", t, self.tokens)
+            candle_core::bail!(
+                "rowwise weighted-sum token mismatch: attn={} op={}",
+                t,
+                self.tokens
+            )
         }
-        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads {
+        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads
+        {
             candle_core::bail!(
                 "rowwise weighted-sum invalid head config: full_heads={} kv_heads={} repeat_factor={}",
                 full_heads,
@@ -1418,7 +1526,10 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
             self.head_dim,
             self.kind,
         );
-        Ok((CpuStorage::F32(out), Shape::from((b, full_heads, self.head_dim))))
+        Ok((
+            CpuStorage::F32(out),
+            Shape::from((b, full_heads, self.head_dim)),
+        ))
     }
 
     #[cfg(feature = "metal")]
@@ -1441,24 +1552,41 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
             candle_core::bail!("rowwise weighted-sum op expects all tensors on the same device");
         }
         if s1.dtype() != DType::F32 {
-            candle_core::bail!("rowwise weighted-sum expects F32 attn probs, got {:?}", s1.dtype())
+            candle_core::bail!(
+                "rowwise weighted-sum expects F32 attn probs, got {:?}",
+                s1.dtype()
+            )
         }
         if s2.dtype() != DType::U8 {
-            candle_core::bail!("rowwise weighted-sum expects U8 packed data, got {:?}", s2.dtype())
+            candle_core::bail!(
+                "rowwise weighted-sum expects U8 packed data, got {:?}",
+                s2.dtype()
+            )
         }
         if s3.dtype() != DType::F32 {
-            candle_core::bail!("rowwise weighted-sum expects F32 scales, got {:?}", s3.dtype())
+            candle_core::bail!(
+                "rowwise weighted-sum expects F32 scales, got {:?}",
+                s3.dtype()
+            )
         }
 
         let ad = l1.shape().dims();
         if ad.len() != 3 {
-            candle_core::bail!("rowwise weighted-sum expects attn rank-3 [b,h,t], got {:?}", ad)
+            candle_core::bail!(
+                "rowwise weighted-sum expects attn rank-3 [b,h,t], got {:?}",
+                ad
+            )
         }
         let (b, full_heads, t) = (ad[0], ad[1], ad[2]);
         if t != self.tokens {
-            candle_core::bail!("rowwise weighted-sum token mismatch: attn={} op={}", t, self.tokens)
+            candle_core::bail!(
+                "rowwise weighted-sum token mismatch: attn={} op={}",
+                t,
+                self.tokens
+            )
         }
-        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads {
+        if full_heads % self.repeat_factor != 0 || full_heads / self.repeat_factor != self.kv_heads
+        {
             candle_core::bail!(
                 "rowwise weighted-sum invalid head config: full_heads={} kv_heads={} repeat_factor={}",
                 full_heads,
@@ -1504,21 +1632,24 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
             ));
         }
 
-        let bh_u32 = u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
-        let full_heads_u32 =
-            u32::try_from(full_heads).map_err(|_| candle_core::Error::msg("full_heads too large"))?;
-        let kv_heads_u32 =
-            u32::try_from(self.kv_heads).map_err(|_| candle_core::Error::msg("kv_heads too large"))?;
+        let bh_u32 =
+            u32::try_from(bh_full).map_err(|_| candle_core::Error::msg("bh_full too large"))?;
+        let full_heads_u32 = u32::try_from(full_heads)
+            .map_err(|_| candle_core::Error::msg("full_heads too large"))?;
+        let kv_heads_u32 = u32::try_from(self.kv_heads)
+            .map_err(|_| candle_core::Error::msg("kv_heads too large"))?;
         let repeat_u32 = u32::try_from(self.repeat_factor)
             .map_err(|_| candle_core::Error::msg("repeat_factor too large"))?;
-        let t_u32 = u32::try_from(self.tokens).map_err(|_| candle_core::Error::msg("tokens too large"))?;
-        let d_u32 = u32::try_from(self.head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let t_u32 =
+            u32::try_from(self.tokens).map_err(|_| candle_core::Error::msg("tokens too large"))?;
+        let d_u32 = u32::try_from(self.head_dim)
+            .map_err(|_| candle_core::Error::msg("head_dim too large"))?;
 
         let metal = s1.device().metal_device();
         let pipeline = get_or_create_kv_attn_pipeline(s1.device().id(), metal, kernel_name)?;
-        let output = s1
-            .device()
-            .new_buffer(out_elems, DType::F32, "kv-attn-rowwise-weighted-sum-out")?;
+        let output =
+            s1.device()
+                .new_buffer(out_elems, DType::F32, "kv-attn-rowwise-weighted-sum-out")?;
         let encoder = s1.device().command_encoder()?;
         encoder.set_label("candelora_kv_attn_rowwise_weighted_sum");
         encoder.set_compute_pipeline_state(&pipeline);
@@ -1592,10 +1723,18 @@ const KV_ATTN_METAL: &str = include_str!("metal_src/kv_attn.metal");
 /// - `scores`: `[batch, heads, tokens]` in `F32`.
 pub fn qk_scores(q: &Tensor, k: &Tensor, scale: f64) -> Result<Tensor> {
     if !q.device().same_device(k.device()) {
-        candle_core::bail!("device mismatch in fused kv-attn qk op: q={:?}, k={:?}", q.device(), k.device());
+        candle_core::bail!(
+            "device mismatch in fused kv-attn qk op: q={:?}, k={:?}",
+            q.device(),
+            k.device()
+        );
     }
     if q.dtype() != k.dtype() {
-        candle_core::bail!("dtype mismatch in fused kv-attn qk op: q={:?}, k={:?}", q.dtype(), k.dtype());
+        candle_core::bail!(
+            "dtype mismatch in fused kv-attn qk op: q={:?}, k={:?}",
+            q.dtype(),
+            k.dtype()
+        );
     }
     if q.rank() != 3 || k.rank() != 4 {
         candle_core::bail!(
@@ -1604,9 +1743,12 @@ pub fn qk_scores(q: &Tensor, k: &Tensor, scale: f64) -> Result<Tensor> {
             k.dims()
         );
     }
-    q.apply_op2_no_bwd(k, &QkScoresOp {
-        scale: scale as f32,
-    })
+    q.apply_op2_no_bwd(
+        k,
+        &QkScoresOp {
+            scale: scale as f32,
+        },
+    )
 }
 
 /// Computes weighted sum over values using attention probabilities.
@@ -1751,11 +1893,19 @@ fn try_pack_rowwise_quantized_metal(
         let (packed_storage, packed_layout) = packed.storage_and_layout();
         let (scales_storage, scales_layout) = scales.storage_and_layout();
 
-        let (x_metal, packed_metal, scales_metal) = match (&*x_storage, &*packed_storage, &*scales_storage) {
-            (candle_core::Storage::Metal(xm), candle_core::Storage::Metal(pm), candle_core::Storage::Metal(sm)) => (xm, pm, sm),
-            _ => return Ok(None),
-        };
-        if !x_layout.is_contiguous() || !packed_layout.is_contiguous() || !scales_layout.is_contiguous() {
+        let (x_metal, packed_metal, scales_metal) =
+            match (&*x_storage, &*packed_storage, &*scales_storage) {
+                (
+                    candle_core::Storage::Metal(xm),
+                    candle_core::Storage::Metal(pm),
+                    candle_core::Storage::Metal(sm),
+                ) => (xm, pm, sm),
+                _ => return Ok(None),
+            };
+        if !x_layout.is_contiguous()
+            || !packed_layout.is_contiguous()
+            || !scales_layout.is_contiguous()
+        {
             candle_core::bail!("fused rowwise pack expects contiguous layouts")
         }
 
@@ -1770,8 +1920,10 @@ fn try_pack_rowwise_quantized_metal(
                 candle_core::bail!("unsupported dtype for fused rowwise pack op: {:?}", dt)
             }
         };
-        let rows_u32 = u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
-        let d_u32 = u32::try_from(head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
+        let rows_u32 =
+            u32::try_from(rows).map_err(|_| candle_core::Error::msg("rows too large"))?;
+        let d_u32 =
+            u32::try_from(head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
         let metal = x_metal.device().metal_device();
         let pipeline = get_or_create_kv_attn_pipeline(x_metal.device().id(), metal, kernel_name)?;
         let encoder = x_metal.device().command_encoder()?;
@@ -1791,9 +1943,14 @@ fn try_pack_rowwise_quantized_metal(
             offset_in_bytes: scales_layout.start_offset() * DType::F32.size_in_bytes(),
         };
         let encoder_ref = &encoder;
-        candle_metal_kernels::set_params!(encoder_ref, (rows_u32, d_u32, &x_bo, &packed_bo, &scales_bo));
+        candle_metal_kernels::set_params!(
+            encoder_ref,
+            (rows_u32, d_u32, &x_bo, &packed_bo, &scales_bo)
+        );
 
-        let threads = pipeline.max_total_threads_per_threadgroup().min(rows.max(1));
+        let threads = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(rows.max(1));
         let groups = rows.div_ceil(threads);
         let tg_count = MTLSize {
             width: groups,
@@ -1838,7 +1995,10 @@ pub fn pack_rowwise_quantized(
         candle_core::bail!("pack_rowwise_quantized requires head_dim > 0")
     }
     if x.rank() < 1 {
-        candle_core::bail!("pack_rowwise_quantized expects rank >= 1 tensor, got {:?}", x.dims())
+        candle_core::bail!(
+            "pack_rowwise_quantized expects rank >= 1 tensor, got {:?}",
+            x.dims()
+        )
     }
     let x = x.contiguous()?;
     let disable_fused = std::env::var("CANDELORA_DISABLE_FUSED_PACK")
