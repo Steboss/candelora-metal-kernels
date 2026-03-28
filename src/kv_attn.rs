@@ -2152,10 +2152,12 @@ fn cpu_qk_scores_turboquant_impl<T: Copy, F: Fn(T) -> f32 + Copy>(
     tokens: usize,
     head_dim: usize,
     subvector_dim: usize,
+    scale_block_dim: usize,
     signed_max: i32,
     scale: f32,
 ) -> Vec<f32> {
     let num_subvectors = head_dim / subvector_dim;
+    let num_scale_blocks = head_dim / scale_block_dim;
     let mut out = vec![0f32; batch * full_heads * tokens];
     let mut q_rot = vec![0f32; head_dim];
     for b in 0..batch {
@@ -2173,7 +2175,8 @@ fn cpu_qk_scores_turboquant_impl<T: Copy, F: Fn(T) -> f32 + Copy>(
                 let row = ((b * kv_heads + kv_head) * tokens) + tok;
                 let mut acc = 0f32;
                 for sub in 0..num_subvectors {
-                    let scale_idx = row * num_subvectors + sub;
+                    let block = (sub * subvector_dim) / scale_block_dim;
+                    let scale_idx = row * num_scale_blocks + block;
                     let sub_scale = scales[scale_idx];
                     let residual_scale = residual_scales
                         .as_ref()
@@ -2281,6 +2284,7 @@ fn cpu_qk_scores_turboquant(
         tokens,
         head_dim,
         subvector_dim,
+        subvector_dim,
         kind.signed_max(),
         scale as f32,
     );
@@ -2299,6 +2303,7 @@ fn cpu_qk_scores_turboquant_packed(
     tokens: usize,
     head_dim: usize,
     subvector_dim: usize,
+    scale_block_dim: usize,
     code_bits: usize,
     kind: TurboQuantKind,
     scale: f64,
@@ -2357,6 +2362,7 @@ fn cpu_qk_scores_turboquant_packed(
         tokens,
         head_dim,
         subvector_dim,
+        scale_block_dim,
         kind.signed_max(),
         scale as f32,
     );
@@ -2821,6 +2827,7 @@ fn try_qk_scores_turboquant_packed_metal(
     tokens: usize,
     head_dim: usize,
     subvector_dim: usize,
+    scale_block_dim: usize,
     code_bits: usize,
     kind: TurboQuantKind,
     scale: f64,
@@ -2947,6 +2954,8 @@ fn try_qk_scores_turboquant_packed_metal(
             u32::try_from(head_dim).map_err(|_| candle_core::Error::msg("head_dim too large"))?;
         let sub_u32 = u32::try_from(subvector_dim)
             .map_err(|_| candle_core::Error::msg("subvector_dim too large"))?;
+        let scale_block_u32 = u32::try_from(scale_block_dim)
+            .map_err(|_| candle_core::Error::msg("scale_block_dim too large"))?;
         let code_bits_u32 =
             u32::try_from(code_bits).map_err(|_| candle_core::Error::msg("code_bits too large"))?;
         let signed_max = kind.signed_max();
@@ -2998,6 +3007,7 @@ fn try_qk_scores_turboquant_packed_metal(
                 t_u32,
                 d_u32,
                 sub_u32,
+                scale_block_u32,
                 code_bits_u32,
                 signed_max,
                 use_residual_signs,
@@ -3282,10 +3292,10 @@ pub fn qk_scores_turboquant(
 /// Shapes:
 /// - `q`: `[batch, full_heads, head_dim]`
 /// - `packed_codes`: `[packed_code_bytes]`
-/// - `scales`: `[rows, num_subvectors]` in `F32` or `F16`
+/// - `scales`: `[rows, num_scale_blocks]` in `F32` or `F16`
 /// - `pair_signs`: `[head_dim / 2]`
 /// - `packed_residual_signs`: optional `[packed_sign_bytes]`
-/// - `residual_scales`: optional `[rows, num_subvectors]` in `F32` or `F16`
+/// - `residual_scales`: optional `[rows, num_scale_blocks]` in `F32` or `F16`
 ///
 /// Where:
 /// - `rows = batch * kv_heads * tokens`
@@ -3306,6 +3316,7 @@ pub fn qk_scores_turboquant_packed(
     tokens: usize,
     head_dim: usize,
     subvector_dim: usize,
+    scale_block_dim: usize,
     code_bits: usize,
     kind: TurboQuantKind,
     scale: f64,
@@ -3318,6 +3329,9 @@ pub fn qk_scores_turboquant_packed(
     }
     if subvector_dim == 0 {
         candle_core::bail!("turboquant packed qk requires subvector_dim > 0")
+    }
+    if scale_block_dim == 0 {
+        candle_core::bail!("turboquant packed qk requires scale_block_dim > 0")
     }
     if code_bits == 0 || code_bits > 8 {
         candle_core::bail!(
@@ -3335,6 +3349,20 @@ pub fn qk_scores_turboquant_packed(
         candle_core::bail!(
             "turboquant packed qk requires head_dim divisible by subvector_dim ({} % {} != 0)",
             head_dim,
+            subvector_dim
+        )
+    }
+    if head_dim % scale_block_dim != 0 {
+        candle_core::bail!(
+            "turboquant packed qk requires head_dim divisible by scale_block_dim ({} % {} != 0)",
+            head_dim,
+            scale_block_dim
+        )
+    }
+    if scale_block_dim % subvector_dim != 0 {
+        candle_core::bail!(
+            "turboquant packed qk requires scale_block_dim divisible by subvector_dim ({} % {} != 0)",
+            scale_block_dim,
             subvector_dim
         )
     }
@@ -3383,7 +3411,7 @@ pub fn qk_scores_turboquant_packed(
     }
 
     let rows = batch * kv_heads * tokens;
-    let num_subvectors = head_dim / subvector_dim;
+    let num_scale_blocks = head_dim / scale_block_dim;
     let code_value_count = rows * head_dim;
     let packed_code_bytes = (code_value_count * code_bits).div_ceil(8);
     if packed_codes.elem_count() != packed_code_bytes {
@@ -3400,12 +3428,12 @@ pub fn qk_scores_turboquant_packed(
         )
     }
     let scales_dims = scales.dims();
-    if scales_dims != [rows, num_subvectors] {
+    if scales_dims != [rows, num_scale_blocks] {
         candle_core::bail!(
             "turboquant packed qk scales shape mismatch: got {:?}, expected [{}, {}]",
             scales_dims,
             rows,
-            num_subvectors
+            num_scale_blocks
         )
     }
     if !matches!(scales.dtype(), DType::F32 | DType::F16) {
@@ -3456,12 +3484,12 @@ pub fn qk_scores_turboquant_packed(
             )
         }
         let rscale_dims = rscales.dims();
-        if rscale_dims != [rows, num_subvectors] {
+        if rscale_dims != [rows, num_scale_blocks] {
             candle_core::bail!(
                 "turboquant packed qk residual_scales shape mismatch: got {:?}, expected [{}, {}]",
                 rscale_dims,
                 rows,
-                num_subvectors
+                num_scale_blocks
             )
         }
         if !matches!(rscales.dtype(), DType::F32 | DType::F16) {
@@ -3500,6 +3528,7 @@ pub fn qk_scores_turboquant_packed(
         tokens,
         head_dim,
         subvector_dim,
+        scale_block_dim,
         code_bits,
         kind,
         scale,
@@ -3519,6 +3548,7 @@ pub fn qk_scores_turboquant_packed(
         tokens,
         head_dim,
         subvector_dim,
+        scale_block_dim,
         code_bits,
         kind,
         scale,
@@ -3702,6 +3732,7 @@ mod tests {
             2,
             4,
             2,
+            2,
             TurboQuantKind::Turbo3.signed_max(),
             0.5,
         );
@@ -3736,6 +3767,7 @@ mod tests {
             2,
             4,
             2,
+            2,
             3,
             TurboQuantKind::Turbo3,
             0.5,
@@ -3761,6 +3793,7 @@ mod tests {
             2,
             2,
             4,
+            2,
             2,
             TurboQuantKind::Turbo3.signed_max(),
             0.5,
@@ -3898,6 +3931,7 @@ mod tests {
             2,
             4,
             2,
+            2,
             3,
             TurboQuantKind::Turbo3,
             0.5,
@@ -3928,6 +3962,7 @@ mod tests {
             2,
             2,
             4,
+            2,
             2,
             3,
             TurboQuantKind::Turbo3,

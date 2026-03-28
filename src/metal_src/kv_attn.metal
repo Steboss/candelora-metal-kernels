@@ -287,17 +287,18 @@ template <typename T, typename S>
     constant uint& t [[buffer(4)]],
     constant uint& d [[buffer(5)]],
     constant uint& subvector_dim [[buffer(6)]],
-    constant uint& code_bits [[buffer(7)]],
-    constant int& signed_max [[buffer(8)]],
-    constant uint& use_residual_signs [[buffer(9)]],
-    constant float& attn_scale [[buffer(10)]],
-    const device T* q [[buffer(11)]],
-    const device uchar* packed_codes [[buffer(12)]],
-    const device S* scales [[buffer(13)]],
-    const device float* pair_signs [[buffer(14)]],
-    const device uchar* packed_residual_signs [[buffer(15)]],
-    const device S* residual_scales [[buffer(16)]],
-    device float* out [[buffer(17)]],
+    constant uint& scale_block_dim [[buffer(7)]],
+    constant uint& code_bits [[buffer(8)]],
+    constant int& signed_max [[buffer(9)]],
+    constant uint& use_residual_signs [[buffer(10)]],
+    constant float& attn_scale [[buffer(11)]],
+    const device T* q [[buffer(12)]],
+    const device uchar* packed_codes [[buffer(13)]],
+    const device S* scales [[buffer(14)]],
+    const device float* pair_signs [[buffer(15)]],
+    const device uchar* packed_residual_signs [[buffer(16)]],
+    const device S* residual_scales [[buffer(17)]],
+    device float* out [[buffer(18)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint n = bh_full * t;
@@ -313,7 +314,7 @@ template <typename T, typename S>
     uint row = (b * kv_heads + kv_h) * t + tok;
     uint q_base = bh_idx * d;
     uint row_base = row * d;
-    uint num_subvectors = d / subvector_dim;
+    uint num_scale_blocks = d / scale_block_dim;
 
     float acc = 0.0f;
     for (uint pair_idx = 0; pair_idx < (d / 2); ++pair_idx) {
@@ -322,8 +323,8 @@ template <typename T, typename S>
         float q_rot_i = float(q[q_base + i]);
         float q_rot_j = float(q[q_base + j]);
 
-        uint sub_i = i / subvector_dim;
-        uint scale_idx_i = row * num_subvectors + sub_i;
+        uint block_i = i / scale_block_dim;
+        uint scale_idx_i = row * num_scale_blocks + block_i;
         float sub_scale_i = float(scales[scale_idx_i]);
         int code_i = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + i)) - signed_max;
         acc += q_rot_i * (float(code_i) * sub_scale_i);
@@ -334,8 +335,8 @@ template <typename T, typename S>
             acc += q_rot_i * residual_sign_i * residual_scale_i;
         }
 
-        uint sub_j = j / subvector_dim;
-        uint scale_idx_j = row * num_subvectors + sub_j;
+        uint block_j = j / scale_block_dim;
+        uint scale_idx_j = row * num_scale_blocks + block_j;
         float sub_scale_j = float(scales[scale_idx_j]);
         int code_j = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + j)) - signed_max;
         acc += q_rot_j * (float(code_j) * sub_scale_j);
@@ -446,17 +447,18 @@ template <typename T, typename S, uint SUBVECTOR_DIM>
     constant uint& t [[buffer(4)]],
     constant uint& d [[buffer(5)]],
     constant uint& subvector_dim [[buffer(6)]],
-    constant uint& code_bits [[buffer(7)]],
-    constant int& signed_max [[buffer(8)]],
-    constant uint& use_residual_signs [[buffer(9)]],
-    constant float& attn_scale [[buffer(10)]],
-    const device T* q [[buffer(11)]],
-    const device uchar* packed_codes [[buffer(12)]],
-    const device S* scales [[buffer(13)]],
-    const device float* pair_signs [[buffer(14)]],
-    const device uchar* packed_residual_signs [[buffer(15)]],
-    const device S* residual_scales [[buffer(16)]],
-    device float* out [[buffer(17)]],
+    constant uint& scale_block_dim [[buffer(7)]],
+    constant uint& code_bits [[buffer(8)]],
+    constant int& signed_max [[buffer(9)]],
+    constant uint& use_residual_signs [[buffer(10)]],
+    constant float& attn_scale [[buffer(11)]],
+    const device T* q [[buffer(12)]],
+    const device uchar* packed_codes [[buffer(13)]],
+    const device S* scales [[buffer(14)]],
+    const device float* pair_signs [[buffer(15)]],
+    const device uchar* packed_residual_signs [[buffer(16)]],
+    const device S* residual_scales [[buffer(17)]],
+    device float* out [[buffer(18)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 threads_per_tg [[threads_per_threadgroup]]
@@ -476,7 +478,8 @@ template <typename T, typename S, uint SUBVECTOR_DIM>
     uint h = bh_idx % full_heads;
     uint kv_h = h / repeat_factor;
     uint q_base = bh_idx * d;
-    uint num_subvectors = d / SUBVECTOR_DIM;
+    uint num_scale_blocks = d / scale_block_dim;
+    uint subvectors_per_block = scale_block_dim / SUBVECTOR_DIM;
     uint thread_count = max(uint(1), threads_per_tg.x);
 
     for (uint pair_idx = tid; pair_idx < (d / 2); pair_idx += thread_count) {
@@ -494,32 +497,35 @@ template <typename T, typename S, uint SUBVECTOR_DIM>
         uint row = (b * kv_heads + kv_h) * t + tok;
         uint row_base = row * d;
         float acc = 0.0f;
-        for (uint sub = 0; sub < num_subvectors; ++sub) {
-            uint scale_idx = row * num_subvectors + sub;
+        for (uint block = 0; block < num_scale_blocks; ++block) {
+            uint scale_idx = row * num_scale_blocks + block;
             float sub_scale = float(scales[scale_idx]);
             float residual_scale = use_residual_signs != 0 ? float(residual_scales[scale_idx]) : 0.0f;
-            uint sub_base = sub * SUBVECTOR_DIM;
+            uint block_base = block * scale_block_dim;
 
-            for (uint pair_local = 0; pair_local < (SUBVECTOR_DIM / 2); ++pair_local) {
-                uint i = sub_base + pair_local * 2;
-                uint j = i + 1;
-                float q_rot_i = q_rot_shared[i];
-                float q_rot_j = q_rot_shared[j];
+            for (uint local_sub = 0; local_sub < subvectors_per_block; ++local_sub) {
+                uint sub_base = block_base + local_sub * SUBVECTOR_DIM;
+                for (uint pair_local = 0; pair_local < (SUBVECTOR_DIM / 2); ++pair_local) {
+                    uint i = sub_base + pair_local * 2;
+                    uint j = i + 1;
+                    float q_rot_i = q_rot_shared[i];
+                    float q_rot_j = q_rot_shared[j];
 
-                int code_i = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + i)) - signed_max;
-                acc += q_rot_i * (float(code_i) * sub_scale);
-                if (use_residual_signs != 0) {
-                    float residual_sign_i =
-                        unpack_packed_u8_value(packed_residual_signs, 1, row_base + i) == 0 ? -1.0f : 1.0f;
-                    acc += q_rot_i * residual_sign_i * residual_scale;
-                }
+                    int code_i = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + i)) - signed_max;
+                    acc += q_rot_i * (float(code_i) * sub_scale);
+                    if (use_residual_signs != 0) {
+                        float residual_sign_i =
+                            unpack_packed_u8_value(packed_residual_signs, 1, row_base + i) == 0 ? -1.0f : 1.0f;
+                        acc += q_rot_i * residual_sign_i * residual_scale;
+                    }
 
-                int code_j = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + j)) - signed_max;
-                acc += q_rot_j * (float(code_j) * sub_scale);
-                if (use_residual_signs != 0) {
-                    float residual_sign_j =
-                        unpack_packed_u8_value(packed_residual_signs, 1, row_base + j) == 0 ? -1.0f : 1.0f;
-                    acc += q_rot_j * residual_sign_j * residual_scale;
+                    int code_j = int(unpack_packed_u8_value(packed_codes, code_bits, row_base + j)) - signed_max;
+                    acc += q_rot_j * (float(code_j) * sub_scale);
+                    if (use_residual_signs != 0) {
+                        float residual_sign_j =
+                            unpack_packed_u8_value(packed_residual_signs, 1, row_base + j) == 0 ? -1.0f : 1.0f;
+                        acc += q_rot_j * residual_sign_j * residual_scale;
+                    }
                 }
             }
         }
@@ -536,17 +542,18 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
     constant uint& t [[buffer(4)]],
     constant uint& d [[buffer(5)]],
     constant uint& subvector_dim [[buffer(6)]],
-    constant uint& code_bits [[buffer(7)]],
-    constant int& signed_max [[buffer(8)]],
-    constant uint& use_residual_signs [[buffer(9)]],
-    constant float& attn_scale [[buffer(10)]],
-    const device half* q [[buffer(11)]],
-    const device uchar* packed_codes [[buffer(12)]],
-    const device half* scales [[buffer(13)]],
-    const device float* pair_signs [[buffer(14)]],
-    const device uchar* packed_residual_signs [[buffer(15)]],
-    const device half* residual_scales [[buffer(16)]],
-    device float* out [[buffer(17)]],
+    constant uint& scale_block_dim [[buffer(7)]],
+    constant uint& code_bits [[buffer(8)]],
+    constant int& signed_max [[buffer(9)]],
+    constant uint& use_residual_signs [[buffer(10)]],
+    constant float& attn_scale [[buffer(11)]],
+    const device half* q [[buffer(12)]],
+    const device uchar* packed_codes [[buffer(13)]],
+    const device half* scales [[buffer(14)]],
+    const device float* pair_signs [[buffer(15)]],
+    const device uchar* packed_residual_signs [[buffer(16)]],
+    const device half* residual_scales [[buffer(17)]],
+    device float* out [[buffer(18)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 threads_per_tg [[threads_per_threadgroup]]
@@ -568,7 +575,8 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
     uint h = bh_idx % full_heads;
     uint kv_h = h / repeat_factor;
     uint q_base = bh_idx * d;
-    uint num_subvectors = d / SUBVECTOR_DIM;
+    uint num_scale_blocks = d / scale_block_dim;
+    uint subvectors_per_block = scale_block_dim / SUBVECTOR_DIM;
     uint thread_count = max(uint(1), threads_per_tg.x);
 
     for (uint pair_idx = tid; pair_idx < (d / 2); pair_idx += thread_count) {
@@ -586,48 +594,54 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
         uint row = (b * kv_heads + kv_h) * t + tok;
         uint row_base = row * d;
         float acc = 0.0f;
-        for (uint sub = 0; sub < num_subvectors; ++sub) {
-            uint sub_base = sub * SUBVECTOR_DIM;
-            uint scale_idx = row * num_subvectors + sub;
+        for (uint block = 0; block < num_scale_blocks; ++block) {
+            uint scale_idx = row * num_scale_blocks + block;
             float sub_scale = float(scales[scale_idx]);
+            uint block_base = block * scale_block_dim;
 
             if constexpr (SUBVECTOR_DIM == 4) {
-                float4 qv = float4(
-                    q_rot_shared[sub_base + 0],
-                    q_rot_shared[sub_base + 1],
-                    q_rot_shared[sub_base + 2],
-                    q_rot_shared[sub_base + 3]
-                );
-                uint4 codes4 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base);
-                acc += dot(qv, centered_codes_to_float4(codes4, signed_max, sub_scale));
-                if constexpr (HAS_RESIDUAL) {
-                    float residual_scale = float(residual_scales[scale_idx]);
-                    float4 signs4 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
-                    acc += dot(qv, signs4 * residual_scale);
+                for (uint local_sub = 0; local_sub < subvectors_per_block; ++local_sub) {
+                    uint sub_base = block_base + local_sub * SUBVECTOR_DIM;
+                    float4 qv = float4(
+                        q_rot_shared[sub_base + 0],
+                        q_rot_shared[sub_base + 1],
+                        q_rot_shared[sub_base + 2],
+                        q_rot_shared[sub_base + 3]
+                    );
+                    uint4 codes4 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base);
+                    acc += dot(qv, centered_codes_to_float4(codes4, signed_max, sub_scale));
+                    if constexpr (HAS_RESIDUAL) {
+                        float residual_scale = float(residual_scales[scale_idx]);
+                        float4 signs4 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
+                        acc += dot(qv, signs4 * residual_scale);
+                    }
                 }
             } else {
-                float4 qv0 = float4(
-                    q_rot_shared[sub_base + 0],
-                    q_rot_shared[sub_base + 1],
-                    q_rot_shared[sub_base + 2],
-                    q_rot_shared[sub_base + 3]
-                );
-                float4 qv1 = float4(
-                    q_rot_shared[sub_base + 4],
-                    q_rot_shared[sub_base + 5],
-                    q_rot_shared[sub_base + 6],
-                    q_rot_shared[sub_base + 7]
-                );
-                uint4 codes0 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base);
-                uint4 codes1 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base + 4);
-                acc += dot(qv0, centered_codes_to_float4(codes0, signed_max, sub_scale));
-                acc += dot(qv1, centered_codes_to_float4(codes1, signed_max, sub_scale));
-                if constexpr (HAS_RESIDUAL) {
-                    float residual_scale = float(residual_scales[scale_idx]);
-                    float4 signs0 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
-                    float4 signs1 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base + 4);
-                    acc += dot(qv0, signs0 * residual_scale);
-                    acc += dot(qv1, signs1 * residual_scale);
+                for (uint local_sub = 0; local_sub < subvectors_per_block; ++local_sub) {
+                    uint sub_base = block_base + local_sub * SUBVECTOR_DIM;
+                    float4 qv0 = float4(
+                        q_rot_shared[sub_base + 0],
+                        q_rot_shared[sub_base + 1],
+                        q_rot_shared[sub_base + 2],
+                        q_rot_shared[sub_base + 3]
+                    );
+                    float4 qv1 = float4(
+                        q_rot_shared[sub_base + 4],
+                        q_rot_shared[sub_base + 5],
+                        q_rot_shared[sub_base + 6],
+                        q_rot_shared[sub_base + 7]
+                    );
+                    uint4 codes0 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base);
+                    uint4 codes1 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base + 4);
+                    acc += dot(qv0, centered_codes_to_float4(codes0, signed_max, sub_scale));
+                    acc += dot(qv1, centered_codes_to_float4(codes1, signed_max, sub_scale));
+                    if constexpr (HAS_RESIDUAL) {
+                        float residual_scale = float(residual_scales[scale_idx]);
+                        float4 signs0 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
+                        float4 signs1 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base + 4);
+                        acc += dot(qv0, signs0 * residual_scale);
+                        acc += dot(qv1, signs1 * residual_scale);
+                    }
                 }
             }
         }
