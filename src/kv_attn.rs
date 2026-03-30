@@ -1244,9 +1244,17 @@ impl CustomOp3 for RowwiseQkScoresOp {
             CpuStorage::U8(v) => contiguous_slice(v, l2, "packed_k")?,
             _ => candle_core::bail!("rowwise qk expects U8 packed data"),
         };
+        let scales_f16_to_f32;
         let scales = match s3 {
             CpuStorage::F32(v) => contiguous_slice(v, l3, "k_scales")?,
-            _ => candle_core::bail!("rowwise qk expects F32 scales"),
+            CpuStorage::F16(v) => {
+                scales_f16_to_f32 = contiguous_slice(v, l3, "k_scales")?
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .collect::<Vec<_>>();
+                &scales_f16_to_f32
+            }
+            _ => candle_core::bail!("rowwise qk expects F32 or F16 scales"),
         };
         let out = match s1 {
             CpuStorage::F32(q) => cpu_qk_scores_rowwise_f32(
@@ -1354,18 +1362,28 @@ impl CustomOp3 for RowwiseQkScoresOp {
         if s2.dtype() != DType::U8 {
             candle_core::bail!("rowwise qk expects U8 packed data, got {:?}", s2.dtype())
         }
-        if s3.dtype() != DType::F32 {
-            candle_core::bail!("rowwise qk expects F32 scales, got {:?}", s3.dtype())
+        if !matches!(s3.dtype(), DType::F32 | DType::F16) {
+            candle_core::bail!("rowwise qk expects F32 or F16 scales, got {:?}", s3.dtype())
         }
 
-        let kernel_name = match (self.kind, s1.dtype()) {
-            (RowwiseQuantKind::Int8, DType::F32) => "qk_scores_rowwise_q8_f32",
-            (RowwiseQuantKind::Int8, DType::F16) => "qk_scores_rowwise_q8_f16",
-            (RowwiseQuantKind::Int8, DType::BF16) => "qk_scores_rowwise_q8_bf16",
-            (RowwiseQuantKind::Int4, DType::F32) => "qk_scores_rowwise_q4_f32",
-            (RowwiseQuantKind::Int4, DType::F16) => "qk_scores_rowwise_q4_f16",
-            (RowwiseQuantKind::Int4, DType::BF16) => "qk_scores_rowwise_q4_bf16",
-            (_, dt) => candle_core::bail!("unsupported q dtype for rowwise qk op: {:?}", dt),
+        let kernel_name = match (self.kind, s1.dtype(), s3.dtype()) {
+            (RowwiseQuantKind::Int8, DType::F32, DType::F32) => "qk_scores_rowwise_q8_f32",
+            (RowwiseQuantKind::Int8, DType::F32, DType::F16) => "qk_scores_rowwise_q8_f32_sf16",
+            (RowwiseQuantKind::Int8, DType::F16, DType::F32) => "qk_scores_rowwise_q8_f16",
+            (RowwiseQuantKind::Int8, DType::F16, DType::F16) => "qk_scores_rowwise_q8_f16_sf16",
+            (RowwiseQuantKind::Int8, DType::BF16, DType::F32) => "qk_scores_rowwise_q8_bf16",
+            (RowwiseQuantKind::Int8, DType::BF16, DType::F16) => "qk_scores_rowwise_q8_bf16_sf16",
+            (RowwiseQuantKind::Int4, DType::F32, DType::F32) => "qk_scores_rowwise_q4_f32",
+            (RowwiseQuantKind::Int4, DType::F32, DType::F16) => "qk_scores_rowwise_q4_f32_sf16",
+            (RowwiseQuantKind::Int4, DType::F16, DType::F32) => "qk_scores_rowwise_q4_f16",
+            (RowwiseQuantKind::Int4, DType::F16, DType::F16) => "qk_scores_rowwise_q4_f16_sf16",
+            (RowwiseQuantKind::Int4, DType::BF16, DType::F32) => "qk_scores_rowwise_q4_bf16",
+            (RowwiseQuantKind::Int4, DType::BF16, DType::F16) => "qk_scores_rowwise_q4_bf16_sf16",
+            (_, q_dt, scale_dt) => candle_core::bail!(
+                "unsupported dtypes for rowwise qk op: q={:?} scales={:?}",
+                q_dt,
+                scale_dt
+            ),
         };
 
         let bh_full = b * full_heads;
@@ -1526,9 +1544,17 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
             CpuStorage::U8(v) => contiguous_slice(v, l2, "packed_v")?,
             _ => candle_core::bail!("rowwise weighted-sum expects U8 packed data"),
         };
+        let scales_f16_to_f32;
         let scales = match s3 {
             CpuStorage::F32(v) => contiguous_slice(v, l3, "v_scales")?,
-            _ => candle_core::bail!("rowwise weighted-sum expects F32 scales"),
+            CpuStorage::F16(v) => {
+                scales_f16_to_f32 = contiguous_slice(v, l3, "v_scales")?
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .collect::<Vec<_>>();
+                &scales_f16_to_f32
+            }
+            _ => candle_core::bail!("rowwise weighted-sum expects F32 or F16 scales"),
         };
         let out = cpu_attn_weighted_sum_rowwise(
             attn,
@@ -1579,9 +1605,9 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
                 s2.dtype()
             )
         }
-        if s3.dtype() != DType::F32 {
+        if !matches!(s3.dtype(), DType::F32 | DType::F16) {
             candle_core::bail!(
-                "rowwise weighted-sum expects F32 scales, got {:?}",
+                "rowwise weighted-sum expects F32 or F16 scales, got {:?}",
                 s3.dtype()
             )
         }
@@ -1630,9 +1656,15 @@ impl CustomOp3 for RowwiseAttnWeightedSumOp {
             )
         }
 
-        let kernel_name = match self.kind {
-            RowwiseQuantKind::Int8 => "attn_weighted_sum_rowwise_q8",
-            RowwiseQuantKind::Int4 => "attn_weighted_sum_rowwise_q4",
+        let kernel_name = match (self.kind, s3.dtype()) {
+            (RowwiseQuantKind::Int8, DType::F32) => "attn_weighted_sum_rowwise_q8",
+            (RowwiseQuantKind::Int8, DType::F16) => "attn_weighted_sum_rowwise_q8_sf16",
+            (RowwiseQuantKind::Int4, DType::F32) => "attn_weighted_sum_rowwise_q4",
+            (RowwiseQuantKind::Int4, DType::F16) => "attn_weighted_sum_rowwise_q4_sf16",
+            (_, dt) => candle_core::bail!(
+                "unsupported scale dtype for rowwise weighted-sum op: {:?}",
+                dt
+            ),
         };
 
         let bh_full = b * full_heads;

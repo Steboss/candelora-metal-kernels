@@ -64,7 +64,7 @@ template [[host_name("attn_weighted_sum_v_f32")]] [[kernel]] decltype(attn_weigh
 template [[host_name("attn_weighted_sum_v_f16")]] [[kernel]] decltype(attn_weighted_sum_kernel<half>) attn_weighted_sum_kernel<half>;
 template [[host_name("attn_weighted_sum_v_bf16")]] [[kernel]] decltype(attn_weighted_sum_kernel<bfloat>) attn_weighted_sum_kernel<bfloat>;
 
-template <typename T, bool IS_Q4>
+template <typename T, typename S, bool IS_Q4>
 [[kernel]] void qk_scores_rowwise_quant_kernel(
     constant uint& bh_full [[buffer(0)]],
     constant uint& full_heads [[buffer(1)]],
@@ -75,7 +75,7 @@ template <typename T, bool IS_Q4>
     constant float& attn_scale [[buffer(6)]],
     const device T* q [[buffer(7)]],
     const device uchar* kq [[buffer(8)]],
-    const device float* k_scales [[buffer(9)]],
+    const device S* k_scales [[buffer(9)]],
     device float* out [[buffer(10)]],
     uint gid [[thread_position_in_grid]]
 ) {
@@ -90,7 +90,7 @@ template <typename T, bool IS_Q4>
     uint h = bh_idx % full_heads;
     uint kv_h = h / repeat_factor;
     uint row = (b * kv_heads + kv_h) * t + tok;
-    float row_scale = k_scales[row];
+    float row_scale = float(k_scales[row]);
 
     uint q_base = bh_idx * d;
     float acc = 0.0f;
@@ -113,12 +113,18 @@ template <typename T, bool IS_Q4>
     out[gid] = acc * attn_scale;
 }
 
-template [[host_name("qk_scores_rowwise_q8_f32")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, false>) qk_scores_rowwise_quant_kernel<float, false>;
-template [[host_name("qk_scores_rowwise_q8_f16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, false>) qk_scores_rowwise_quant_kernel<half, false>;
-template [[host_name("qk_scores_rowwise_q8_bf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, false>) qk_scores_rowwise_quant_kernel<bfloat, false>;
-template [[host_name("qk_scores_rowwise_q4_f32")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, true>) qk_scores_rowwise_quant_kernel<float, true>;
-template [[host_name("qk_scores_rowwise_q4_f16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, true>) qk_scores_rowwise_quant_kernel<half, true>;
-template [[host_name("qk_scores_rowwise_q4_bf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, true>) qk_scores_rowwise_quant_kernel<bfloat, true>;
+template [[host_name("qk_scores_rowwise_q8_f32")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, float, false>) qk_scores_rowwise_quant_kernel<float, float, false>;
+template [[host_name("qk_scores_rowwise_q8_f32_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, half, false>) qk_scores_rowwise_quant_kernel<float, half, false>;
+template [[host_name("qk_scores_rowwise_q8_f16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, float, false>) qk_scores_rowwise_quant_kernel<half, float, false>;
+template [[host_name("qk_scores_rowwise_q8_f16_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, half, false>) qk_scores_rowwise_quant_kernel<half, half, false>;
+template [[host_name("qk_scores_rowwise_q8_bf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, float, false>) qk_scores_rowwise_quant_kernel<bfloat, float, false>;
+template [[host_name("qk_scores_rowwise_q8_bf16_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, half, false>) qk_scores_rowwise_quant_kernel<bfloat, half, false>;
+template [[host_name("qk_scores_rowwise_q4_f32")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, float, true>) qk_scores_rowwise_quant_kernel<float, float, true>;
+template [[host_name("qk_scores_rowwise_q4_f32_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<float, half, true>) qk_scores_rowwise_quant_kernel<float, half, true>;
+template [[host_name("qk_scores_rowwise_q4_f16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, float, true>) qk_scores_rowwise_quant_kernel<half, float, true>;
+template [[host_name("qk_scores_rowwise_q4_f16_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<half, half, true>) qk_scores_rowwise_quant_kernel<half, half, true>;
+template [[host_name("qk_scores_rowwise_q4_bf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, float, true>) qk_scores_rowwise_quant_kernel<bfloat, float, true>;
+template [[host_name("qk_scores_rowwise_q4_bf16_sf16")]] [[kernel]] decltype(qk_scores_rowwise_quant_kernel<bfloat, half, true>) qk_scores_rowwise_quant_kernel<bfloat, half, true>;
 
 
 
@@ -600,6 +606,12 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
             uint block_base = block * scale_block_dim;
 
             if constexpr (SUBVECTOR_DIM == 4) {
+                float residual_scale = 0.0f;
+                float4 residual_vec = float4(0.0f);
+                if constexpr (HAS_RESIDUAL) {
+                    residual_scale = float(residual_scales[scale_idx]);
+                    residual_vec = float4(residual_scale);
+                }
                 for (uint local_sub = 0; local_sub < subvectors_per_block; ++local_sub) {
                     uint sub_base = block_base + local_sub * SUBVECTOR_DIM;
                     float4 qv = float4(
@@ -611,12 +623,15 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
                     uint4 codes4 = unpack4_packed_codes<CODE_BITS>(packed_codes, row_base + sub_base);
                     acc += dot(qv, centered_codes_to_float4(codes4, signed_max, sub_scale));
                     if constexpr (HAS_RESIDUAL) {
-                        float residual_scale = float(residual_scales[scale_idx]);
                         float4 signs4 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
-                        acc += dot(qv, signs4 * residual_scale);
+                        acc += dot(qv, signs4 * residual_vec);
                     }
                 }
             } else {
+                float residual_scale = 0.0f;
+                if constexpr (HAS_RESIDUAL) {
+                    residual_scale = float(residual_scales[scale_idx]);
+                }
                 for (uint local_sub = 0; local_sub < subvectors_per_block; ++local_sub) {
                     uint sub_base = block_base + local_sub * SUBVECTOR_DIM;
                     float4 qv0 = float4(
@@ -636,7 +651,6 @@ template <uint SUBVECTOR_DIM, uint CODE_BITS, bool HAS_RESIDUAL>
                     acc += dot(qv0, centered_codes_to_float4(codes0, signed_max, sub_scale));
                     acc += dot(qv1, centered_codes_to_float4(codes1, signed_max, sub_scale));
                     if constexpr (HAS_RESIDUAL) {
-                        float residual_scale = float(residual_scales[scale_idx]);
                         float4 signs0 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base);
                         float4 signs1 = unpack4_packed_signs_pm1(packed_residual_signs, row_base + sub_base + 4);
                         acc += dot(qv0, signs0 * residual_scale);
@@ -697,7 +711,7 @@ template [[host_name("qk_scores_turbo_packed_fast_sv8c3_res_qf16_sf16")]] [[kern
 template [[host_name("qk_scores_turbo_packed_fast_sv8c4_nr_qf16_sf16")]] [[kernel]] decltype(qk_scores_turboquant_packed_kernel_fixed_subvector_f16_f16<8, 4, false>) qk_scores_turboquant_packed_kernel_fixed_subvector_f16_f16<8, 4, false>;
 template [[host_name("qk_scores_turbo_packed_fast_sv8c4_res_qf16_sf16")]] [[kernel]] decltype(qk_scores_turboquant_packed_kernel_fixed_subvector_f16_f16<8, 4, true>) qk_scores_turboquant_packed_kernel_fixed_subvector_f16_f16<8, 4, true>;
 
-template <bool IS_Q4>
+template <typename S, bool IS_Q4>
 [[kernel]] void attn_weighted_sum_rowwise_quant_kernel(
     constant uint& bh_full [[buffer(0)]],
     constant uint& full_heads [[buffer(1)]],
@@ -707,7 +721,7 @@ template <bool IS_Q4>
     constant uint& d [[buffer(5)]],
     const device float* attn [[buffer(6)]],
     const device uchar* vq [[buffer(7)]],
-    const device float* v_scales [[buffer(8)]],
+    const device S* v_scales [[buffer(8)]],
     device float* out [[buffer(9)]],
     uint gid [[thread_position_in_grid]]
 ) {
@@ -729,7 +743,7 @@ template <bool IS_Q4>
             uint row = (b * kv_heads + kv_h) * t + tok;
             uint v_idx = row * d + dim;
             int qv = int(vq[v_idx]) - 128;
-            acc += attn[attn_base + tok] * (float(qv) * v_scales[row]);
+            acc += attn[attn_base + tok] * (float(qv) * float(v_scales[row]));
         }
     } else {
         uint packed_cols = (d + 1) / 2;
@@ -739,14 +753,16 @@ template <bool IS_Q4>
             uchar byte = vq[byte_idx];
             uchar nib = ((dim & 1) == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
             int qv = (nib >= 8) ? (int(nib) - 16) : int(nib);
-            acc += attn[attn_base + tok] * (float(qv) * v_scales[row]);
+            acc += attn[attn_base + tok] * (float(qv) * float(v_scales[row]));
         }
     }
     out[gid] = acc;
 }
 
-template [[host_name("attn_weighted_sum_rowwise_q8")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<false>) attn_weighted_sum_rowwise_quant_kernel<false>;
-template [[host_name("attn_weighted_sum_rowwise_q4")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<true>) attn_weighted_sum_rowwise_quant_kernel<true>;
+template [[host_name("attn_weighted_sum_rowwise_q8")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<float, false>) attn_weighted_sum_rowwise_quant_kernel<float, false>;
+template [[host_name("attn_weighted_sum_rowwise_q8_sf16")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<half, false>) attn_weighted_sum_rowwise_quant_kernel<half, false>;
+template [[host_name("attn_weighted_sum_rowwise_q4")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<float, true>) attn_weighted_sum_rowwise_quant_kernel<float, true>;
+template [[host_name("attn_weighted_sum_rowwise_q4_sf16")]] [[kernel]] decltype(attn_weighted_sum_rowwise_quant_kernel<half, true>) attn_weighted_sum_rowwise_quant_kernel<half, true>;
 
 template <typename T>
 [[kernel]] void pack_scales_rowwise_kernel(
